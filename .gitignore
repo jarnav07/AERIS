@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.bl
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Downloaded/generated research artifacts
+data/raw/*
+!data/raw/.gitkeep
+models/*
+!models/.gitkeep
+results/*
+!results/.gitkeep
