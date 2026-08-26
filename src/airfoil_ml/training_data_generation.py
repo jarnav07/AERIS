@@ -1,15 +1,14 @@
 """Reproducible stochastic training-data generation for the airfoil surrogate.
 
 The generator follows the stochastic geometry/operating-point strategy used by
-NeuralFoil, but keeps this project self-contained. XFOIL supplies the
-full aerodynamic and boundary-layer labels.
+NeuralFoil, but keeps this project self-contained. XFOIL supplies the full
+aerodynamic and boundary-layer labels.
 
 Each successful operating point is stored as one fixed-width vector containing
 18 Kulfan geometry parameters, 6 flow/transition inputs, solver confidence,
-5 aerodynamic outputs, and 192 boundary-layer values (32 sensors x 3 fields x
-2 surfaces): 222 numeric values per sample.
+5 aerodynamic outputs, and 192 boundary-layer values: 222 numeric values per
+sample.
 """
-
 from __future__ import annotations
 
 import json
@@ -47,8 +46,6 @@ TRAINING_VECTOR_SIZE = len(TRAINING_VECTOR_COLUMNS)
 
 @dataclass(frozen=True)
 class TrainingDataConfig:
-    """Sampling and XFOIL settings."""
-
     n_airfoils_to_combine: int = 3
     alpha_grid: tuple[float, ...] = (-15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0)
     alpha_jitter_uniform: float = 2.5
@@ -81,7 +78,6 @@ def _kulfan_vector(airfoil: asb.KulfanAirfoil) -> np.ndarray:
 
 
 def load_kulfan_database(coordinates_dir: str | Path | None = None) -> KulfanDatabase:
-    """Load and parameterize the airfoil database used for sampling."""
     if coordinates_dir is None:
         database_path = asb._asb_root / "geometry" / "airfoil" / "airfoil_database"
         paths = sorted(database_path.glob("*.dat"))
@@ -90,7 +86,6 @@ def load_kulfan_database(coordinates_dir: str | Path | None = None) -> KulfanDat
         database_path = Path(coordinates_dir)
         paths = sorted(database_path.glob("*.dat"))
         airfoils = tuple(asb.Airfoil(coordinates=p).normalize().to_kulfan_airfoil() for p in paths)
-
     if not airfoils:
         raise FileNotFoundError(f"No .dat airfoils found in {database_path}")
     kulfans = np.stack([_kulfan_vector(airfoil) for airfoil in airfoils])
@@ -98,7 +93,6 @@ def load_kulfan_database(coordinates_dir: str | Path | None = None) -> KulfanDat
 
 
 def sample_airfoil(database: KulfanDatabase, rng: np.random.Generator, config: TrainingDataConfig) -> asb.KulfanAirfoil:
-    """Blend three database airfoils, then perturb in Kulfan space."""
     if config.n_airfoils_to_combine < 2:
         raise ValueError("n_airfoils_to_combine must be at least 2")
     cuts = np.sort(rng.random(config.n_airfoils_to_combine - 1))
@@ -121,16 +115,13 @@ def sample_airfoil(database: KulfanDatabase, rng: np.random.Generator, config: T
 
 
 def sample_operating_point(rng: np.random.Generator, config: TrainingDataConfig) -> dict[str, object]:
-    """Sample the same alpha/Re/transition distributions used by NeuralFoil."""
     alphas = (np.asarray(config.alpha_grid, dtype=float)
               + rng.uniform(-config.alpha_jitter_uniform, config.alpha_jitter_uniform)
               + config.alpha_jitter_normal_sigma * rng.standard_normal())
     reynolds = float(10 ** (config.log10_re_mean + config.log10_re_sigma * rng.standard_normal()))
     n_crit = float(rng.uniform(config.n_crit_min, config.n_crit_max))
-
     def transition() -> float:
         return 1.0 if rng.random() < config.forced_transition_probability else float(rng.uniform(0.0, 1.0))
-
     return {"alphas": alphas, "reynolds": reynolds, "mach": config.mach,
             "n_crit": n_crit, "xtr_upper": transition(), "xtr_lower": transition()}
 
@@ -138,8 +129,7 @@ def sample_operating_point(rng: np.random.Generator, config: TrainingDataConfig)
 def _split_boundary_layer(bl_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     x = bl_data["x"].to_numpy(float)
     dx = np.diff(x)
-    negative = np.flatnonzero(dx < 0)
-    positive = np.flatnonzero(dx > 0)
+    negative, positive = np.flatnonzero(dx < 0), np.flatnonzero(dx > 0)
     if len(negative) == 0 or len(positive) == 0:
         raise ValueError("could not identify upper/lower boundary-layer surfaces")
     upper = bl_data.iloc[:negative[-1] + 2].iloc[::-1].copy()
@@ -150,8 +140,7 @@ def _split_boundary_layer(bl_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
 
 
 def _interpolate_surface(data: pd.DataFrame, value_column: str) -> np.ndarray:
-    x = data["x"].to_numpy(float)
-    y = data[value_column].to_numpy(float)
+    x, y = data["x"].to_numpy(float), data[value_column].to_numpy(float)
     valid = np.isfinite(x) & np.isfinite(y)
     x, y = x[valid], y[valid]
     if len(x) < 4:
@@ -166,7 +155,6 @@ def _interpolate_surface(data: pd.DataFrame, value_column: str) -> np.ndarray:
 
 
 def _analyse_airfoil(airfoil: asb.KulfanAirfoil, operating: dict[str, object], config: TrainingDataConfig, xfoil_executable: str) -> list[np.ndarray]:
-    """Run XFOIL with boundary-layer extraction and flatten each result."""
     xf = asb.XFoil(
         airfoil=airfoil.normalize().to_kulfan_airfoil(),
         Re=float(operating["reynolds"]), mach=float(operating["mach"]),
@@ -178,10 +166,10 @@ def _analyse_airfoil(airfoil: asb.KulfanAirfoil, operating: dict[str, object], c
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning)
         outputs = xf.alpha(np.asarray(operating["alphas"], dtype=float))
-
     returned_alphas = np.asarray(outputs.get("alpha", []), dtype=float)
     if len(returned_alphas) == 0:
         return []
+
     vectors = []
     for requested_alpha in np.asarray(operating["alphas"], dtype=float):
         differences = np.abs(returned_alphas - requested_alpha)
@@ -196,7 +184,6 @@ def _analyse_airfoil(airfoil: asb.KulfanAirfoil, operating: dict[str, object], c
             ]
         except (IndexError, KeyError, TypeError, ValueError):
             continue
-
         vector = np.concatenate([
             _kulfan_vector(airfoil),
             np.array([
@@ -213,24 +200,17 @@ def _analyse_airfoil(airfoil: asb.KulfanAirfoil, operating: dict[str, object], c
     return vectors
 
 
-def generate_training_dataset(
-    output_csv: str | Path,
-    coordinate_output_dir: str | Path,
-    *, n_cases: int = 100, seed: int = 42,
-    database_coordinates_dir: str | Path | None = None,
-    xfoil_executable: str = "xfoil", config: TrainingDataConfig = TrainingDataConfig(),
-) -> dict[str, object]:
-    """Generate a finite, fully labelled training dataset."""
+def generate_training_dataset(output_csv: str | Path, coordinate_output_dir: str | Path, *, n_cases: int = 100, seed: int = 42, database_coordinates_dir: str | Path | None = None, xfoil_executable: str = "xfoil", config: TrainingDataConfig = TrainingDataConfig()) -> dict[str, object]:
     if n_cases <= 0:
         raise ValueError("n_cases must be positive")
     rng = np.random.default_rng(seed)
     database = load_kulfan_database(database_coordinates_dir)
-    output_csv = Path(output_csv)
-    coordinate_output_dir = Path(coordinate_output_dir)
+    output_csv, coordinate_output_dir = Path(output_csv), Path(coordinate_output_dir)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     coordinate_output_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[np.ndarray] = []
+    row_airfoil_ids: list[str] = []
     failures: list[dict[str, str]] = []
     for case_index in range(n_cases):
         airfoil = sample_airfoil(database, rng, config)
@@ -240,6 +220,7 @@ def generate_training_dataset(
         try:
             vectors = _analyse_airfoil(airfoil, operating, config, xfoil_executable)
             rows.extend(vectors)
+            row_airfoil_ids.extend([airfoil_id] * len(vectors))
             if not vectors:
                 failures.append({"airfoil_id": airfoil_id, "error": "no converged/usable XFOIL points"})
         except Exception as exc:
@@ -248,7 +229,7 @@ def generate_training_dataset(
     if not rows:
         raise RuntimeError("No usable XFOIL training vectors were generated")
     frame = pd.DataFrame(np.vstack(rows), columns=TRAINING_VECTOR_COLUMNS)
-    frame.insert(0, "airfoil_id", [f"TRAIN_{i:06d}" for i in range(len(frame))])
+    frame.insert(0, "airfoil_id", row_airfoil_ids)
     frame.to_csv(output_csv, index=False)
     manifest = {
         "generator": "training_data_generation", "seed": seed, "requested_cases": n_cases,
