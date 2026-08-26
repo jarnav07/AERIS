@@ -13,13 +13,13 @@ from .data import load_dataset
 from .drag_analysis import compute_drag_summary, save_drag_analysis_plots
 from .error_analysis import benchmark_ml, benchmark_xfoil, error_by_regime, percentage_metrics, save_error_summary, time_saved_summary
 from .evaluation import save_evaluation_plots
+from .features import raw_input_matrix
 from .geometry import geometry_from_file
 from .geometry_generation import DEFAULT_CAMBER, DEFAULT_CAMBER_POSITION, DEFAULT_THICKNESS, generate_camber_coordinates, sample_camber_grid
-from .features import raw_input_matrix
 from .large_dataset import CST_COLUMNS, FIXED_TARGET_COLUMNS, download_large_dataset, inverse_fixed_targets, load_fixed_re_dataset, train_fixed_re
 from .large_evaluation import save_fixed_re_plots
-from .multi_re_batch import generate_batch
 from .models import ModelConfig
+from .multi_re_batch import generate_batch
 from .neuralfoil_data_generation import NeuralFoilSamplingConfig, generate_neuralfoil_style_dataset
 from .training import load_model_bundle, train_all
 
@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_large.add_argument("--model", default="mlp")
     evaluate_large.add_argument("--output", default="results/large_fixed_re")
 
-    camber = sub.add_parser("generate-camber", help="generate parametric camber/thickness airfoils")
+    camber = sub.add_parser("generate-camber", help="generate parametric camber/thickness airfoils (optionally with XFOIL labels)")
     camber.add_argument("--output", default="data/raw/generated_coordinates")
     camber.add_argument("--n", type=int, default=None)
     camber.add_argument("--seed", type=int, default=42)
@@ -144,14 +144,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-
     if args.command == "acquire":
         download_uiuc_coordinates(args.airfoils, args.coordinates)
         generate_dataset(args.coordinates, args.polar_csv, args.reynolds, airfoil_ids=args.airfoils, xfoil_executable=args.xfoil, alpha_start=args.alpha_start, alpha_end=args.alpha_end, alpha_step=args.alpha_step, timeout_seconds=args.xfoil_timeout)
     elif args.command == "generate-neuralfoil":
         config = NeuralFoilSamplingConfig(xfoil_timeout=args.xfoil_timeout, xfoil_iterations=args.xfoil_iterations)
-        manifest = generate_neuralfoil_style_dataset(output_csv=args.polar_output, coordinate_output_dir=args.coordinates_output, n_cases=args.cases, seed=args.seed, database_coordinates_dir=args.database_coordinates, xfoil_executable=args.xfoil, config=config)
-        print(json.dumps(manifest, indent=2))
+        print(json.dumps(generate_neuralfoil_style_dataset(output_csv=args.polar_output, coordinate_output_dir=args.coordinates_output, n_cases=args.cases, seed=args.seed, database_coordinates_dir=args.database_coordinates, xfoil_executable=args.xfoil, config=config), indent=2))
+    elif args.command == "download-large":
+        path = download_large_dataset(args.output)
+        print(json.dumps({"path": str(path)}))
     elif args.command == "generate-camber":
         camber_values = tuple(float(v) for v in args.camber_values.split(",")) if args.camber_values else None
         camber_positions = tuple(float(v) for v in args.camber_positions.split(",")) if args.camber_positions else None
@@ -175,11 +176,10 @@ def main() -> None:
         else:
             selected = args.airfoils
         print(json.dumps(generate_batch(args.coordinates, args.output, selected, reynolds_values=args.reynolds, alpha_start=args.alpha_start, alpha_end=args.alpha_end, alpha_step=args.alpha_step, mach=args.mach, timeout_seconds=args.xfoil_timeout, workers=args.workers), indent=2))
-    elif args.command == "download-large":
-        print(json.dumps({"path": str(download_large_dataset(args.output))}))
     elif args.command == "train-large":
         dataset = load_fixed_re_dataset(args.csv)
-        print(json.dumps(train_fixed_re(dataset, args.output, seed=args.seed, log_cd=not args.no_log_cd), indent=2))
+        metrics = train_fixed_re(dataset, args.output, seed=args.seed, log_cd=not args.no_log_cd)
+        print(json.dumps(metrics, indent=2))
     elif args.command == "evaluate-large":
         dataset = load_fixed_re_dataset(args.csv)
         model, processor = load_model_bundle(args.model_dir, args.model)
@@ -199,25 +199,63 @@ def main() -> None:
         test_airfoils = None
         if args.test_airfoils_json:
             test_airfoils = json.loads(Path(args.test_airfoils_json).read_text())["test_airfoils"]
-        print(json.dumps(train_all(dataset, args.output, seed=args.seed, model_config=config, only=args.only, log_cd=args.log_cd, test_airfoils=test_airfoils), indent=2))
+        metrics = train_all(dataset, args.output, seed=args.seed, model_config=config, only=args.only, log_cd=args.log_cd, test_airfoils=test_airfoils)
+        print(json.dumps(metrics, indent=2))
     elif args.command == "evaluate":
         dataset = load_dataset(args.polar_csv, args.coordinates, args.points)
         model, processor = load_model_bundle(args.model_dir, args.model)
         manifest = json.loads((Path(args.model_dir) / "split_manifest.json").read_text())
         test_ids = set(manifest["test_airfoils"])
         frame = dataset.frame[dataset.frame.airfoil_id.isin(test_ids)].copy()
-        y = frame[["cl", "cd", "cm"]].to_numpy(float)
-        x = np.vstack([raw_input_matrix([dataset.geometries[str(row.airfoil_id)]], np.array([row.alpha_deg]), np.array([row.reynolds]), np.array([row.mach]))[0] for row in frame.itertuples()])
-        predictions = processor.inverse_targets(model.predict(processor.input_scaler.transform(x)))
+        indices = frame.index.to_numpy()
+        x, y = [], frame[["cl", "cd", "cm"]].to_numpy(float)
+        for row in frame.itertuples():
+            x.append(raw_input_matrix([dataset.geometries[str(row.airfoil_id)]], np.array([row.alpha_deg]), np.array([row.reynolds]), np.array([row.mach]))[0])
+        predictions = processor.inverse_targets(model.predict(processor.input_scaler.transform(np.asarray(x))))
         save_evaluation_plots(frame, y, predictions, args.output)
-        print(json.dumps({"model": args.model, "rows": len(frame), "airfoils": int(frame.airfoil_id.nunique())}))
+        print(json.dumps({"model": args.model, "rows": len(frame), "indices": indices.tolist()}))
+    elif args.command == "analyze-error":
+        dataset = load_dataset(args.polar_csv, args.coordinates, args.points)
+        manifest = json.loads((Path(args.model_dir) / "split_manifest.json").read_text())
+        test_ids = set(manifest["test_airfoils"])
+        test_frame = dataset.frame[dataset.frame.airfoil_id.isin(test_ids)].copy()
+        model_names = args.models or [name for name in ["ridge", "random_forest", "hist_gb", "mlp", "mlp_torch"] if (Path(args.model_dir) / (f"{name}.joblib" if name != "mlp_torch" else "mlp_torch.pt")).exists()]
+        predictions: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for name in model_names:
+            model, processor = load_model_bundle(args.model_dir, name)
+            x = np.vstack([raw_input_matrix([dataset.geometries[str(row.airfoil_id)]], np.array([row.alpha_deg]), np.array([row.reynolds]), np.array([row.mach]))[0] for row in test_frame.itertuples()])
+            actual = test_frame[["cl", "cd", "cm"]].to_numpy(float)
+            predicted = processor.inverse_targets(model.predict(processor.input_scaler.transform(x)))
+            predictions[name] = (actual, predicted)
+        summary = {"overall": {name: percentage_metrics(actual, predicted) for name, (actual, predicted) in predictions.items()}, "regimes": error_by_regime(test_frame, predictions)}
+        timing: dict[str, object] = {}
+        if args.xfoil_benchmark:
+            benchmark_airfoils = args.benchmark_airfoils or sorted(test_ids)[:2]
+            timing["xfoil_benchmark"] = benchmark_xfoil(args.coordinates, benchmark_airfoils, args.benchmark_reynolds)
+        timing["ml_benchmark"] = benchmark_ml(args.model_dir, model_names, np.vstack([raw_input_matrix([dataset.geometries[str(row.airfoil_id)]], np.array([row.alpha_deg]), np.array([row.reynolds]), np.array([row.mach]))[0] for row in test_frame.itertuples()]),)
+        if "xfoil_benchmark" in timing and model_names:
+            timing["time_saved"] = time_saved_summary(timing["xfoil_benchmark"], timing["ml_benchmark"], model_names[0])
+        save_error_summary(test_frame, predictions, args.output, timing, summary)
+        print(json.dumps(summary, indent=2))
+    elif args.command == "analyze-drag":
+        dataset = load_dataset(args.polar_csv, args.coordinates, args.points)
+        manifest = json.loads((Path(args.model_dir) / "split_manifest.json").read_text())
+        test_ids = set(manifest["test_airfoils"])
+        test_frame = dataset.frame[dataset.frame.airfoil_id.isin(test_ids)].copy()
+        model_names = args.models or [name for name in ["ridge", "random_forest", "hist_gb", "mlp", "mlp_torch"] if (Path(args.model_dir) / (f"{name}.joblib" if name != "mlp_torch" else "mlp_torch.pt")).exists()]
+        predictions: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for name in model_names:
+            model, processor = load_model_bundle(args.model_dir, name)
+            x = np.vstack([raw_input_matrix([dataset.geometries[str(row.airfoil_id)]], np.array([row.alpha_deg]), np.array([row.reynolds]), np.array([row.mach]))[0] for row in test_frame.itertuples()])
+            actual = test_frame[["cl", "cd", "cm"]].to_numpy(float)
+            predicted = processor.inverse_targets(model.predict(processor.input_scaler.transform(x)))
+            predictions[name] = (actual, predicted)
+        summary = {name: compute_drag_summary(test_frame, actual, predicted) for name, (actual, predicted) in predictions.items()}
+        save_drag_analysis_plots(test_frame, predictions, args.output, summary)
+        print(json.dumps(summary, indent=2))
     elif args.command == "predict":
         model, processor = load_model_bundle(args.model_dir, args.model)
         geometry = geometry_from_file(args.coordinates, n_points=args.points)
         x = raw_input_matrix([geometry], np.array([args.alpha]), np.array([args.reynolds]), np.array([args.mach]))
         prediction = processor.inverse_targets(model.predict(processor.input_scaler.transform(x)))[0]
         print(json.dumps(dict(zip(("cl", "cd", "cm"), prediction.tolist())), indent=2))
-    elif args.command == "analyze-error":
-        raise NotImplementedError("Existing analyze-error implementation remains available from the prior project revision; use airfoil_ml.error_analysis directly until CLI merge is refreshed.")
-    elif args.command == "analyze-drag":
-        raise NotImplementedError("Existing analyze-drag implementation remains available from the prior project revision; use airfoil_ml.drag_analysis directly until CLI merge is refreshed.")
