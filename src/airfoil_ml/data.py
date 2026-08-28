@@ -1,39 +1,52 @@
-"""Dataset assembly and reproducible grouped splitting."""
+"""Dataset schema, validation, and leakage-safe grouped splitting."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-from .geometry import AirfoilGeometry, geometry_from_file
-
-REQUIRED_POLAR_COLUMNS = ("airfoil_id", "alpha_deg", "reynolds", "mach", "cl", "cd", "cm")
+KULFAN_COLUMNS = (
+    *[f"kulfan_upper_{i}" for i in range(8)],
+    *[f"kulfan_lower_{i}" for i in range(8)],
+    "kulfan_LE_weight",
+    "kulfan_TE_thickness",
+)
+FLOW_COLUMNS = ("alpha_deg", "reynolds", "mach")
+TARGET_COLUMNS = ("cl", "cd", "cm")
 
 
 @dataclass
 class AeroDataset:
+    """The single canonical XFOIL dataset used by every model."""
+
     frame: pd.DataFrame
-    geometries: dict[str, AirfoilGeometry]
 
     def validate(self) -> None:
-        missing = set(REQUIRED_POLAR_COLUMNS) - set(self.frame.columns)
+        required = set((*KULFAN_COLUMNS, *FLOW_COLUMNS, *TARGET_COLUMNS, "airfoil_id"))
+        missing = required - set(self.frame.columns)
         if missing:
-            raise ValueError(f"polar data is missing columns: {sorted(missing)}")
+            raise ValueError(f"dataset is missing columns: {sorted(missing)}")
         if self.frame.empty:
-            raise ValueError("polar data is empty")
-        numeric = [c for c in REQUIRED_POLAR_COLUMNS if c != "airfoil_id"]
-        if not np.isfinite(self.frame[numeric].to_numpy(dtype=float)).all():
-            raise ValueError("polar data contains non-finite values")
+            raise ValueError("dataset is empty")
+
+        numeric = [*KULFAN_COLUMNS, *FLOW_COLUMNS, *TARGET_COLUMNS]
+        values = self.frame[numeric].to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError("dataset contains non-finite numeric values")
         if (self.frame["reynolds"] <= 0).any():
             raise ValueError("Reynolds numbers must be positive")
-        if (self.frame["cd"] < 0).any():
-            raise ValueError("negative drag coefficients are not physically valid")
-        unknown = set(self.frame["airfoil_id"].astype(str)) - set(self.geometries)
-        if unknown:
-            raise ValueError(f"no coordinate file was found for airfoils: {sorted(unknown)}")
+        if (self.frame["cd"] <= 0).any():
+            raise ValueError("Cd must be strictly positive")
+        if self.frame["airfoil_id"].astype(str).nunique() < 3:
+            raise ValueError("at least three distinct airfoil identities are required")
+
+    @property
+    def airfoil_ids(self) -> np.ndarray:
+        return np.array(sorted(self.frame["airfoil_id"].astype(str).unique()))
 
     def grouped_split(
         self,
@@ -42,66 +55,58 @@ class AeroDataset:
         seed: int = 42,
         test_airfoils: list[str] | None = None,
     ) -> dict[str, np.ndarray]:
-        """Split by airfoil ID so no geometry appears in multiple partitions.
-
-        When ``test_airfoils`` is given, exactly those identities form the test
-        partition (a fixed holdout, e.g. reused from a previous experiment so
-        results are directly comparable). The remaining identities are split
-        into train/validation with the same grouped, leakage-safe logic.
-        """
+        """Split by airfoil identity so one geometry never crosses partitions."""
         if test_fraction <= 0 or validation_fraction <= 0 or test_fraction + validation_fraction >= 1:
             raise ValueError("fractions must be positive and sum to less than one")
-        all_ids = np.array(sorted(self.frame["airfoil_id"].astype(str).unique()))
-        if len(all_ids) < 3:
-            raise ValueError("at least three distinct airfoils are required for grouped splitting")
+
+        all_ids = self.airfoil_ids
         rng = np.random.default_rng(seed)
+
         if test_airfoils is not None:
-            test_ids = np.array(sorted(set(str(a) for a in test_airfoils)))
+            test_ids = np.array(sorted(set(map(str, test_airfoils))))
             unknown = set(test_ids) - set(all_ids)
             if unknown:
-                raise ValueError(f"test airfoils not present in the dataset: {sorted(unknown)}")
-            remaining = np.array(sorted(set(all_ids) - set(test_ids)))
-            remaining = rng.permutation(remaining)
+                raise ValueError(f"test airfoils are not present in the dataset: {sorted(unknown)}")
+            remaining = rng.permutation(np.array(sorted(set(all_ids) - set(test_ids))))
             n_val = max(1, int(round(len(remaining) * validation_fraction)))
             if n_val >= len(remaining):
-                n_val = 1
-            val_ids, train_ids = remaining[:n_val], remaining[n_val:]
+                raise ValueError("not enough remaining airfoils for train/validation")
+            val_ids = remaining[:n_val]
+            train_ids = remaining[n_val:]
         else:
-            ids = rng.permutation(all_ids)
-            n_test = max(1, int(round(len(ids) * test_fraction)))
-            n_val = max(1, int(round(len(ids) * validation_fraction)))
-            if n_test + n_val >= len(ids):
-                n_test, n_val = 1, 1
-            test_ids, val_ids, train_ids = ids[:n_test], ids[n_test : n_test + n_val], ids[n_test + n_val :]
+            shuffled = rng.permutation(all_ids)
+            n_test = max(1, int(round(len(shuffled) * test_fraction)))
+            n_val = max(1, int(round(len(shuffled) * validation_fraction)))
+            if n_test + n_val >= len(shuffled):
+                raise ValueError("not enough airfoils for train/validation/test")
+            test_ids = shuffled[:n_test]
+            val_ids = shuffled[n_test : n_test + n_val]
+            train_ids = shuffled[n_test + n_val :]
+
+        ids = self.frame["airfoil_id"].astype(str)
         return {
-            "train": np.flatnonzero(self.frame.airfoil_id.astype(str).isin(train_ids)),
-            "validation": np.flatnonzero(self.frame.airfoil_id.astype(str).isin(val_ids)),
-            "test": np.flatnonzero(self.frame.airfoil_id.astype(str).isin(test_ids)),
+            "train": np.flatnonzero(ids.isin(train_ids)),
+            "validation": np.flatnonzero(ids.isin(val_ids)),
+            "test": np.flatnonzero(ids.isin(test_ids)),
             "train_airfoils": train_ids,
             "validation_airfoils": val_ids,
             "test_airfoils": test_ids,
         }
 
 
-def load_dataset(polar_csv: str | Path, coordinates_dir: str | Path, n_geometry_points: int = 100) -> AeroDataset:
-    frame = pd.read_csv(polar_csv)
+def load_dataset(path: str | Path) -> AeroDataset:
+    """Load and validate the canonical generated dataset."""
+    frame = pd.read_csv(path)
     frame["airfoil_id"] = frame["airfoil_id"].astype(str)
-    geometries: dict[str, AirfoilGeometry] = {}
-    coordinates_dir = Path(coordinates_dir)
-    for airfoil_id in frame.airfoil_id.unique():
-        candidates = [coordinates_dir / f"{airfoil_id}.dat", coordinates_dir / f"{airfoil_id}.txt", coordinates_dir / airfoil_id]
-        coordinate_path = next((p for p in candidates if p.exists()), None)
-        if coordinate_path is None:
-            raise FileNotFoundError(f"no coordinate file found for {airfoil_id} in {coordinates_dir}")
-        geometries[airfoil_id] = geometry_from_file(coordinate_path, n_points=n_geometry_points)
-    dataset = AeroDataset(frame, geometries)
+    dataset = AeroDataset(frame)
     dataset.validate()
     return dataset
 
 
 def save_split_manifest(path: str | Path, split: dict[str, np.ndarray], seed: int) -> None:
-    manifest = {"seed": seed}
+    payload = {"seed": seed}
     for key in ("train_airfoils", "validation_airfoils", "test_airfoils"):
-        manifest[key] = split[key].tolist()
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        payload[key] = split[key].tolist()
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
