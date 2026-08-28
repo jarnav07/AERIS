@@ -1,4 +1,4 @@
-"""Training orchestration for grouped, leakage-safe surrogate modelling."""
+"""Train all surrogate models from the one canonical XFOIL dataset."""
 
 from __future__ import annotations
 
@@ -9,38 +9,30 @@ from pathlib import Path
 import joblib
 import numpy as np
 
-from .data import AeroDataset, save_split_manifest
-from .evaluation import regression_metrics
-from .features import FeaturePreprocessor, fit_preprocessor, raw_input_matrix
+from .data import KULFAN_COLUMNS, TARGET_COLUMNS, AeroDataset, save_split_manifest
+from .features import FeaturePreprocessor, build_feature_matrix, fit_preprocessor
 from .models import ModelConfig, make_models
 
 
-def _matrices(dataset: AeroDataset, indices: np.ndarray, n_geometry_points: int) -> tuple[np.ndarray, np.ndarray]:
-    frame = dataset.frame.iloc[indices]
-    geometries = [dataset.geometries[str(airfoil_id)] for airfoil_id in frame.airfoil_id]
-    inputs = raw_input_matrix(
-        geometries,
-        frame.alpha_deg.to_numpy(float),
-        frame.reynolds.to_numpy(float),
-        frame.mach.to_numpy(float),
-    )
-    targets = frame[["cl", "cd", "cm"]].to_numpy(float)
-    return inputs, targets
+def _targets(frame) -> np.ndarray:
+    return frame[list(TARGET_COLUMNS)].to_numpy(float)
 
 
-def _transform_labels(targets: np.ndarray, log_cd: bool) -> np.ndarray:
-    """Transform training labels; log-Cd makes the model minimize relative Cd error."""
+def _transform_targets(targets: np.ndarray, log_cd: bool) -> np.ndarray:
     transformed = np.asarray(targets, dtype=float).copy()
     if log_cd:
         if np.any(transformed[:, 1] <= 0):
-            raise ValueError("Cd must be positive for log transformation")
+            raise ValueError("Cd must be positive for log-Cd training")
         transformed[:, 1] = np.log(transformed[:, 1])
     return transformed
 
 
-def _inverse_labels(processor: FeaturePreprocessor, scaled_prediction: np.ndarray, log_cd: bool) -> np.ndarray:
-    """Undo the target scaler and, for log-Cd models, exponentiate Cd back to counts."""
-    physical = processor.inverse_targets(scaled_prediction)
+def inverse_targets(
+    processor: FeaturePreprocessor,
+    predictions: np.ndarray,
+    log_cd: bool,
+) -> np.ndarray:
+    physical = processor.inverse_targets(predictions)
     if log_cd:
         physical[:, 1] = np.exp(physical[:, 1])
     return physical
@@ -49,77 +41,119 @@ def _inverse_labels(processor: FeaturePreprocessor, scaled_prediction: np.ndarra
 def train_all(
     dataset: AeroDataset,
     output_dir: str | Path,
+    *,
     seed: int = 42,
     test_fraction: float = 0.2,
     validation_fraction: float = 0.2,
     model_config: ModelConfig | None = None,
     only: list[str] | None = None,
-    log_cd: bool = False,
+    log_cd: bool = True,
     test_airfoils: list[str] | None = None,
-) -> dict[str, dict[str, dict[str, float]]]:
-    """Fit candidate models and save their estimators and train-only preprocessors.
+) -> dict[str, dict[str, dict[str, dict[str, float]]]]:
+    """Train the same candidate set on the same leakage-safe split.
 
-    ``only`` restricts training to the named models so a slow candidate (for
-    example the sklearn MLP on a large dataset) can be trained in a separate,
-    budgeted command without discarding previously trained models. Metrics are
-    merged into an existing ``metrics.json`` when one is present, so partial
-    runs accumulate into one authoritative result file.
-
-    ``test_airfoils`` fixes the held-out identities (e.g. reusing a previous
-    experiment's split manifest), so adding training data can be evaluated
-    against the exact same unseen-airfoil test set.
+    The dataset is split by generated-airfoil identity. Every model receives
+    the identical rows, preprocessing, targets, and held-out test identities.
+    This makes the resulting model-to-model comparison meaningful.
     """
     np.random.seed(seed)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    split = dataset.grouped_split(test_fraction, validation_fraction, seed, test_airfoils=test_airfoils)
+
+    split = dataset.grouped_split(
+        test_fraction=test_fraction,
+        validation_fraction=validation_fraction,
+        seed=seed,
+        test_airfoils=test_airfoils,
+    )
     save_split_manifest(output_dir / "split_manifest.json", split, seed)
-    train_x, train_y = _matrices(dataset, split["train"], next(iter(dataset.geometries.values())).n_points)
-    val_x, val_y = _matrices(dataset, split["validation"], next(iter(dataset.geometries.values())).n_points)
-    test_x, test_y = _matrices(dataset, split["test"], next(iter(dataset.geometries.values())).n_points)
-    # Fit scalers on the training airfoils only, then apply exactly those
-    # transforms to validation, test, and future inference cases. With
-    # log_cd=True the scaler and the model see log(Cd), so the fitted loss is
-    # a relative (percentage) drag error; metrics are always reported in
-    # physical units via _inverse_labels.
-    train_labels = _transform_labels(train_y, log_cd)
-    processor = fit_preprocessor(train_x, train_labels, next(iter(dataset.geometries.values())).n_points)
+
+    train_frame = dataset.frame.iloc[split["train"]]
+    validation_frame = dataset.frame.iloc[split["validation"]]
+    test_frame = dataset.frame.iloc[split["test"]]
+
+    train_x = build_feature_matrix(train_frame)
+    validation_x = build_feature_matrix(validation_frame)
+    test_x = build_feature_matrix(test_frame)
+    train_y = _targets(train_frame)
+    validation_y = _targets(validation_frame)
+    test_y = _targets(test_frame)
+
+    train_y_model = _transform_targets(train_y, log_cd)
+    processor = fit_preprocessor(train_x, train_y_model)
     processor.save(output_dir / "preprocessor.joblib")
-    train_xs, val_xs, test_xs = processor.input_scaler.transform(train_x), processor.input_scaler.transform(val_x), processor.input_scaler.transform(test_x)
-    train_ys = processor.target_scaler.transform(train_labels)
-    val_ys = processor.target_scaler.transform(_transform_labels(val_y, log_cd))
-    test_ys = processor.target_scaler.transform(_transform_labels(test_y, log_cd))
-    results_path = output_dir / "metrics.json"
-    results: dict[str, dict[str, dict[str, float]]] = {}
-    if results_path.exists():
-        results = json.loads(results_path.read_text(encoding="utf-8"))
+
+    train_x_scaled = processor.transform_inputs(train_x)
+    validation_x_scaled = processor.transform_inputs(validation_x)
+    test_x_scaled = processor.transform_inputs(test_x)
+    train_y_scaled = processor.transform_targets(train_y_model)
+
     config = model_config or ModelConfig(seed=seed)
-    models = make_models(config)
-    if only is not None:
-        unknown = set(only) - set(models)
+    available = make_models(config)
+    if only is None:
+        selected = available
+    else:
+        unknown = sorted(set(only) - set(available))
         if unknown:
-            raise ValueError(f"unknown model names: {sorted(unknown)}; available: {sorted(models)}")
-        models = {name: model for name, model in models.items() if name in only}
-    for name, model in models.items():
-        model.fit(train_xs, train_ys)
-        val_pred = _inverse_labels(processor, model.predict(val_xs), log_cd)
-        test_pred = _inverse_labels(processor, model.predict(test_xs), log_cd)
+            raise ValueError(f"unknown models: {unknown}; available: {sorted(available)}")
+        selected = {name: available[name] for name in only}
+
+    results: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
+    for name, model in selected.items():
+        model.fit(train_x_scaled, train_y_scaled)
+        validation_prediction = inverse_targets(
+            processor, model.predict(validation_x_scaled), log_cd
+        )
+        test_prediction = inverse_targets(
+            processor, model.predict(test_x_scaled), log_cd
+        )
+
+        from .evaluation import regression_metrics
+
         results[name] = {
-            "validation": regression_metrics(val_y, val_pred),
-            "test": regression_metrics(test_y, test_pred),
+            "validation": regression_metrics(validation_y, validation_prediction),
+            "test": regression_metrics(test_y, test_prediction),
         }
+
         joblib.dump(model, output_dir / f"{name}.joblib")
-        history = {"loss_curve": [float(value) for value in getattr(model, "loss_curve_", [])]}
-        validation_scores = getattr(model, "validation_scores_", None)
-        if validation_scores is not None:
-            history["validation_scores"] = [float(value) for value in validation_scores]
-        (output_dir / f"history_{name}.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
-        np.savez_compressed(output_dir / f"test_predictions_{name}.npz", actual=test_y, predicted=test_pred, indices=split["test"])
-    (output_dir / "metrics.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-    (output_dir / "training_config.json").write_text(json.dumps({"seed": seed, "log_cd": log_cd, "model_config": asdict(config)}, indent=2) + "\n", encoding="utf-8")
+        np.savez_compressed(
+            output_dir / f"test_predictions_{name}.npz",
+            actual=test_y,
+            predicted=test_prediction,
+            indices=split["test"],
+        )
+
+        history: dict[str, list[float]] = {}
+        for attribute in ("loss_curve_", "validation_scores_"):
+            values = getattr(model, attribute, None)
+            if values is not None:
+                history[attribute] = [float(value) for value in values]
+        (output_dir / f"history_{name}.json").write_text(
+            json.dumps(history, indent=2) + "\n", encoding="utf-8"
+        )
+
+    training_metadata = {
+        "dataset_rows": len(dataset.frame),
+        "dataset_airfoils": int(dataset.frame["airfoil_id"].nunique()),
+        "input_features": [*KULFAN_COLUMNS, "alpha_deg", "log10_reynolds", "mach"],
+        "target_columns": list(TARGET_COLUMNS),
+        "log_cd": log_cd,
+        "seed": seed,
+        "model_names": list(selected),
+        "model_config": asdict(config),
+    }
+    (output_dir / "training_config.json").write_text(
+        json.dumps(training_metadata, indent=2) + "\n", encoding="utf-8"
+    )
+    (output_dir / "metrics.json").write_text(
+        json.dumps(results, indent=2) + "\n", encoding="utf-8"
+    )
     return results
 
 
-def load_model_bundle(model_dir: str | Path, model_name: str = "mlp") -> tuple[object, FeaturePreprocessor]:
+def load_model_bundle(model_dir: str | Path, model_name: str):
     model_dir = Path(model_dir)
-    return joblib.load(model_dir / f"{model_name}.joblib"), FeaturePreprocessor.load(model_dir / "preprocessor.joblib")
+    return (
+        joblib.load(model_dir / f"{model_name}.joblib"),
+        FeaturePreprocessor.load(model_dir / "preprocessor.joblib"),
+    )

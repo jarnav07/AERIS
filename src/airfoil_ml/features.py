@@ -1,4 +1,4 @@
-"""Feature construction and leakage-safe scaling."""
+"""Feature construction and train-only scaling."""
 
 from __future__ import annotations
 
@@ -9,23 +9,18 @@ import joblib
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
-from .geometry import AirfoilGeometry
-
-FLOW_COLUMNS = ("alpha_deg", "reynolds", "mach")
-TARGET_COLUMNS = ("cl", "cd", "cm")
+from .data import KULFAN_COLUMNS
 
 
 @dataclass
 class FeaturePreprocessor:
-    """Scalers fitted only on the training partition."""
+    """Input/target scalers fitted exclusively on the training partition."""
 
     input_scaler: StandardScaler
     target_scaler: StandardScaler
-    n_geometry_points: int
 
-    def transform_inputs(self, geometry_features: np.ndarray, flow: np.ndarray) -> np.ndarray:
-        raw = np.column_stack([geometry_features, flow[:, 0], np.log10(flow[:, 1]), flow[:, 2]])
-        return self.input_scaler.transform(raw)
+    def transform_inputs(self, inputs: np.ndarray) -> np.ndarray:
+        return self.input_scaler.transform(inputs)
 
     def transform_targets(self, targets: np.ndarray) -> np.ndarray:
         return self.target_scaler.transform(targets)
@@ -34,27 +29,32 @@ class FeaturePreprocessor:
         return self.target_scaler.inverse_transform(targets)
 
     def save(self, path: str | Path) -> None:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(self, path)
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self, target)
 
     @classmethod
     def load(cls, path: str | Path) -> "FeaturePreprocessor":
         return joblib.load(path)
 
 
-def raw_input_matrix(geometries: list[AirfoilGeometry], alpha_deg: np.ndarray, reynolds: np.ndarray, mach: np.ndarray) -> np.ndarray:
-    if not (len(geometries) == len(alpha_deg) == len(reynolds) == len(mach)):
-        raise ValueError("geometry and flow arrays must have the same length")
-    if np.any(reynolds <= 0):
+def build_feature_matrix(frame) -> np.ndarray:
+    """Build the common 21-feature matrix used by every surrogate model.
+
+    The 18 Kulfan geometry parameters are followed by angle of attack,
+    log10(Reynolds number), and Mach number.
+    """
+    geometry = frame[list(KULFAN_COLUMNS)].to_numpy(float)
+    flow = frame[["alpha_deg", "reynolds", "mach"]].to_numpy(float)
+    if np.any(flow[:, 1] <= 0):
         raise ValueError("Reynolds number must be positive")
-    geometry_features = np.vstack([g.as_feature_vector() for g in geometries])
-    flow = np.column_stack([alpha_deg, reynolds, mach])
-    return np.column_stack([geometry_features, alpha_deg, np.log10(reynolds), mach])
+    return np.column_stack((geometry, flow[:, 0], np.log10(flow[:, 1]), flow[:, 2]))
 
 
-def fit_preprocessor(inputs: np.ndarray, targets: np.ndarray, n_geometry_points: int) -> FeaturePreprocessor:
-    if inputs.ndim != 2 or targets.ndim != 2:
-        raise ValueError("inputs and targets must be two-dimensional")
-    input_scaler = StandardScaler().fit(inputs)
-    target_scaler = StandardScaler().fit(targets)
-    return FeaturePreprocessor(input_scaler, target_scaler, n_geometry_points)
+def fit_preprocessor(inputs: np.ndarray, targets: np.ndarray) -> FeaturePreprocessor:
+    if inputs.ndim != 2 or targets.ndim != 2 or len(inputs) != len(targets):
+        raise ValueError("inputs and targets must be 2-D matrices with equal row counts")
+    return FeaturePreprocessor(
+        input_scaler=StandardScaler().fit(inputs),
+        target_scaler=StandardScaler().fit(targets),
+    )

@@ -1,3 +1,3 @@
-"""ML aerodynamic surrogate modelling for airfoils."""
+"""ML surrogate models for airfoil aerodynamics."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
