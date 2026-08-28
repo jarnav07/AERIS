@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ml-airfoil-predictor"
-version = "0.1.0"
-description = "An ML surrogate model for airfoil aerodynamic performance"
+version = "0.2.0"
+description = "ML surrogate models for airfoil aerodynamics trained on a shared XFOIL dataset"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,9 +19,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
-# Optional: enables the converged mlp_torch candidate. On Linux the default
-# PyPI wheel bundles CUDA (~2 GB); for a CPU-only install prefer the CPU index
-# command shown in the README.
 torch = ["torch>=2.3"]
 
 [project.scripts]
