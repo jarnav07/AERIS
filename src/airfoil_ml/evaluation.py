@@ -1,105 +1,198 @@
-"""Evaluation metrics and engineering visualizations."""
+"""Metrics and plots for model comparison against XFOIL and CFD references."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-TARGETS = ("cl", "cd", "cm")
+from .data import KULFAN_COLUMNS, TARGET_COLUMNS, AeroDataset
+from .features import build_feature_matrix
 
 
-def regression_metrics_for_targets(actual: np.ndarray, predicted: np.ndarray, targets: tuple[str, ...] | list[str]) -> dict[str, dict[str, float]]:
+# Percentage error is undefined or misleading near zero crossings. The floor
+# is deliberately explicit and reported with every metrics file.
+DEFAULT_PERCENTAGE_FLOORS = {"cl": 0.05, "cd": 1e-4, "cm": 0.01}
+
+
+def regression_metrics(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    percentage_floor: dict[str, float] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Return MAE, RMSE, R² and defined MAPE for Cl/Cd/Cm."""
+    floors = percentage_floor or DEFAULT_PERCENTAGE_FLOORS
     result: dict[str, dict[str, float]] = {}
-    for i, target in enumerate(targets):
+    for index, target in enumerate(TARGET_COLUMNS):
+        reference = np.asarray(actual[:, index], dtype=float)
+        prediction = np.asarray(predicted[:, index], dtype=float)
+        absolute_error = np.abs(reference - prediction)
+        mask = np.abs(reference) >= floors[target]
+        mape = float(np.mean(absolute_error[mask] / np.abs(reference[mask])) * 100) if mask.any() else float("nan")
         result[target] = {
-            "mae": float(mean_absolute_error(actual[:, i], predicted[:, i])),
-            "rmse": float(np.sqrt(mean_squared_error(actual[:, i], predicted[:, i]))),
-            "r2": float(r2_score(actual[:, i], predicted[:, i])),
+            "mae": float(mean_absolute_error(reference, prediction)),
+            "rmse": float(np.sqrt(mean_squared_error(reference, prediction))),
+            "r2": float(r2_score(reference, prediction)),
+            "mape_percent": mape,
+            "percentage_floor": floors[target],
+            "percentage_rows": int(mask.sum()),
         }
     return result
 
 
-def regression_metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, dict[str, float]]:
-    return regression_metrics_for_targets(actual, predicted, TARGETS)
+def discover_models(model_dir: str | Path) -> list[str]:
+    return sorted(
+        path.stem
+        for path in Path(model_dir).glob("*.joblib")
+        if path.stem != "preprocessor"
+    )
 
 
-def error_by_condition(frame: pd.DataFrame, actual: np.ndarray, predicted: np.ndarray) -> pd.DataFrame:
-    errors = pd.DataFrame({"alpha_deg": frame.alpha_deg.to_numpy(), "reynolds": frame.reynolds.to_numpy()})
-    errors["cl_abs_error"] = np.abs(actual[:, 0] - predicted[:, 0])
-    errors["cd_abs_error"] = np.abs(actual[:, 1] - predicted[:, 1])
-    errors["cm_abs_error"] = np.abs(actual[:, 2] - predicted[:, 2])
-    return errors.groupby("alpha_deg", as_index=False).mean(numeric_only=True)
+def _load_training_config(model_dir: str | Path) -> dict:
+    return json.loads((Path(model_dir) / "training_config.json").read_text(encoding="utf-8"))
 
 
-def save_evaluation_plots(frame: pd.DataFrame, actual: np.ndarray, predicted: np.ndarray, output_dir: str | Path, title_prefix: str = "Test") -> None:
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    colors = {"cl": "#176b87", "cd": "#d95f02", "cm": "#5e3c99"}
-    for i, target in enumerate(TARGETS):
+def _predict_saved_models(
+    frame: pd.DataFrame,
+    model_dir: str | Path,
+    model_names: list[str],
+) -> dict[str, np.ndarray]:
+    model_dir = Path(model_dir)
+    processor = joblib.load(model_dir / "preprocessor.joblib")
+    inputs = processor.transform_inputs(build_feature_matrix(frame))
+    log_cd = bool(_load_training_config(model_dir).get("log_cd", True))
+
+    predictions: dict[str, np.ndarray] = {}
+    for name in model_names:
+        model = joblib.load(model_dir / f"{name}.joblib")
+        prediction = processor.inverse_targets(model.predict(inputs))
+        if log_cd:
+            prediction[:, 1] = np.exp(prediction[:, 1])
+        predictions[name] = prediction
+    return predictions
+
+
+def load_test_reference(dataset: AeroDataset, model_dir: str | Path) -> pd.DataFrame:
+    manifest = json.loads((Path(model_dir) / "split_manifest.json").read_text(encoding="utf-8"))
+    test_ids = set(map(str, manifest["test_airfoils"]))
+    frame = dataset.frame[dataset.frame["airfoil_id"].astype(str).isin(test_ids)].copy()
+    if frame.empty:
+        raise ValueError("saved test split contains no rows in the supplied dataset")
+    return frame
+
+
+def _save_parity_plots(
+    actual: np.ndarray,
+    predictions: dict[str, np.ndarray],
+    output_dir: Path,
+    reference_name: str,
+) -> None:
+    for index, target in enumerate(TARGET_COLUMNS):
         fig, ax = plt.subplots(figsize=(6.5, 5.2), constrained_layout=True)
-        ax.scatter(actual[:, i], predicted[:, i], s=18, alpha=0.7, color=colors[target], edgecolor="none")
-        limits = [min(actual[:, i].min(), predicted[:, i].min()), max(actual[:, i].max(), predicted[:, i].max())]
-        ax.plot(limits, limits, "k--", linewidth=1, label="Perfect prediction")
-        ax.set(xlabel=f"Reference {target}", ylabel=f"Predicted {target}", title=f"{title_prefix}: {target} parity")
+        combined = np.concatenate([actual[:, index], *[pred[:, index] for pred in predictions.values()]])
+        low, high = float(np.min(combined)), float(np.max(combined))
+        padding = max((high - low) * 0.03, 1e-8)
+        ax.plot([low - padding, high + padding], [low - padding, high + padding], "k--", linewidth=1)
+        for name, prediction in predictions.items():
+            ax.scatter(actual[:, index], prediction[:, index], s=9, alpha=0.25, label=name)
+        ax.set(
+            xlabel=f"Reference {target}",
+            ylabel="Model prediction",
+            title=f"{reference_name}: {target} parity",
+        )
         ax.legend(frameon=False)
         ax.grid(alpha=0.2)
-        fig.savefig(output_dir / f"parity_{target}.png", dpi=180)
+        fig.savefig(output_dir / f"parity_{target}_{reference_name.lower()}.png", dpi=180)
         plt.close(fig)
 
-    plot_frame = frame.copy()
-    plot_frame["pred_cl"], plot_frame["pred_cd"], plot_frame["pred_cm"] = predicted.T
-    for airfoil_id, group in plot_frame.groupby("airfoil_id"):
-        group = group.sort_values("alpha_deg")
-        fig, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
-        for ax, target, label in zip(axes, ("cl", "cd", "ld"), ("$C_l$", "$C_d$", "$L/D$")):
-            if target == "ld":
-                ref = group.cl / group.cd
-                pred = group.pred_cl / group.pred_cd.clip(lower=1e-8)
-            else:
-                ref = group[target]
-                pred = group[f"pred_{target}"]
-            ax.plot(group.alpha_deg, ref, "o-", label="Reference", color="#1b4965")
-            ax.plot(group.alpha_deg, pred, "s--", label="ML prediction", color="#ca6702")
-            ax.set(xlabel="Angle of attack, α [deg]", ylabel=label, title=f"{airfoil_id}: {label}")
-            ax.grid(alpha=0.2)
-        axes[0].legend(frameon=False)
-        fig.savefig(output_dir / f"polar_{airfoil_id}.png", dpi=180)
-        plt.close(fig)
 
-    errors = error_by_condition(frame, actual, predicted)
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
-    for ax, target in zip(axes, TARGETS):
-        ax.plot(errors.alpha_deg, errors[f"{target}_abs_error"], "o-", color=colors[target])
-        ax.set(xlabel="Angle of attack, α [deg]", ylabel=f"|error in {target}|", title=f"Error vs α: {target}")
-        ax.grid(alpha=0.2)
-    fig.savefig(output_dir / "error_vs_alpha.png", dpi=180)
+def _save_model_comparison_plot(
+    metrics: dict[str, dict[str, dict[str, float]]],
+    output_dir: Path,
+    reference_name: str,
+) -> None:
+    models = list(metrics)
+    x = np.arange(len(models))
+    width = 0.24
+    fig, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
+    for offset, target in enumerate(TARGET_COLUMNS):
+        values = [metrics[model][target]["mape_percent"] for model in models]
+        ax.bar(x + (offset - 1) * width, values, width, label=target)
+    ax.set_xticks(x, models, rotation=20)
+    ax.set_ylabel("Defined MAPE [%]")
+    ax.set_title(f"{reference_name}: model comparison")
+    ax.legend(frameon=False)
+    ax.grid(axis="y", alpha=0.2)
+    fig.savefig(output_dir / f"model_comparison_{reference_name.lower()}.png", dpi=180)
     plt.close(fig)
 
-    condition_errors = pd.DataFrame({"reynolds": frame.reynolds.to_numpy()})
-    condition_errors["cl_abs_error"] = np.abs(actual[:, 0] - predicted[:, 0])
-    condition_errors["cd_abs_error"] = np.abs(actual[:, 1] - predicted[:, 1])
-    condition_errors["cm_abs_error"] = np.abs(actual[:, 2] - predicted[:, 2])
-    by_re = condition_errors.groupby("reynolds", as_index=False).mean(numeric_only=True)
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
-    for ax, target in zip(axes, TARGETS):
-        ax.plot(by_re.reynolds, by_re[f"{target}_abs_error"], "o-", color=colors[target])
-        ax.set(xlabel="Reynolds number, Re", ylabel=f"|error in {target}|", title=f"Error vs Re: {target}")
-        ax.grid(alpha=0.2)
-    fig.savefig(output_dir / "error_vs_reynolds.png", dpi=180)
-    plt.close(fig)
 
-    by_airfoil = condition_errors.copy()
-    by_airfoil["airfoil_id"] = frame.airfoil_id.to_numpy()
-    by_airfoil = by_airfoil.groupby("airfoil_id", as_index=False).mean(numeric_only=True)
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
-    for ax, target in zip(axes, TARGETS):
-        ax.bar(by_airfoil.airfoil_id, by_airfoil[f"{target}_abs_error"], color=colors[target])
-        ax.set(xlabel="Airfoil identity", ylabel=f"mean |error in {target}|", title=f"Error by airfoil: {target}")
-        ax.tick_params(axis="x", rotation=60)
-        ax.grid(axis="y", alpha=0.2)
-    fig.savefig(output_dir / "error_by_airfoil.png", dpi=180)
-    plt.close(fig)
+def save_comparison_report(
+    frame: pd.DataFrame,
+    predictions: dict[str, np.ndarray],
+    output_dir: str | Path,
+    *,
+    reference_name: str,
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Save metrics and comparable plots for one reference dataset."""
+    if not predictions:
+        raise ValueError("no models were selected for evaluation")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    actual = frame[list(TARGET_COLUMNS)].to_numpy(float)
+    metrics = {name: regression_metrics(actual, pred) for name, pred in predictions.items()}
+    payload = {
+        "reference": reference_name,
+        "rows": len(frame),
+        "airfoils": int(frame["airfoil_id"].nunique()) if "airfoil_id" in frame else None,
+        "models": metrics,
+    }
+    (output_dir / "metrics.json").write_text(
+        json.dumps(payload, indent=2, allow_nan=True) + "\n", encoding="utf-8"
+    )
+    _save_parity_plots(actual, predictions, output_dir, reference_name)
+    _save_model_comparison_plot(metrics, output_dir, reference_name)
+    return metrics
+
+
+def evaluate_xfoil_test(
+    dataset: AeroDataset,
+    model_dir: str | Path,
+    output_dir: str | Path,
+    model_names: list[str] | None = None,
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Evaluate all saved models on the unseen-airfoil XFOIL test partition."""
+    names = model_names or discover_models(model_dir)
+    frame = load_test_reference(dataset, model_dir)
+    predictions = _predict_saved_models(frame, model_dir, names)
+    return save_comparison_report(frame, predictions, output_dir, reference_name="XFOIL")
+
+
+def evaluate_cfd_reference(
+    reference_csv: str | Path,
+    model_dir: str | Path,
+    output_dir: str | Path,
+    model_names: list[str] | None = None,
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Compare trained models with an independent CFD CSV.
+
+    CFD data is evaluation-only and is never merged into the XFOIL training
+    dataset. It uses the same 18 Kulfan geometry parameters and alpha/Re/Mach
+    inputs as training, plus CFD Cl/Cd/Cm targets.
+    """
+    frame = pd.read_csv(reference_csv)
+    required = set((*KULFAN_COLUMNS, "alpha_deg", "reynolds", "mach", *TARGET_COLUMNS))
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"CFD reference is missing columns: {sorted(missing)}")
+    if (frame["reynolds"] <= 0).any() or (frame["cd"] <= 0).any():
+        raise ValueError("CFD Reynolds numbers must be positive and CFD Cd must be strictly positive")
+    names = model_names or discover_models(model_dir)
+    predictions = _predict_saved_models(frame, model_dir, names)
+    return save_comparison_report(frame, predictions, output_dir, reference_name="CFD")
