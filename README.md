@@ -1,11 +1,13 @@
-# ML Aerofoil Predictor
+# AERIS
 
-Machine-learning surrogate modelling for airfoil aerodynamics. The project investigates whether machine-learning models can learn the mapping from airfoil geometry and flow conditions to aerodynamic coefficients, using XFOIL-generated data as the reference dataset and comparing multiple models on exactly the same data.
+**Aerodynamic Estimation and Response Inference System**
+
+AERIS is a machine-learning framework for surrogate modelling of aerofoil aerodynamics. The project investigates whether machine-learning models can learn the mapping from aerofoil geometry and flow conditions to aerodynamic coefficients, using a single large XFOIL-generated dataset as the reference dataset and comparing multiple models on exactly the same data.
 
 ## Research pipeline
 
 ```text
-AeroSandbox built-in airfoil database
+AeroSandbox built-in aerofoil database
         |
         | convert source shapes to Kulfan/CST parameters
         v
@@ -14,7 +16,7 @@ Kulfan statistical distribution
         | random parent selection + convex weighting
         | covariance perturbation + random scale
         v
-New synthetic airfoil geometry
+New synthetic aerofoil geometry
         |
         | geometry + stochastic operating conditions
         v
@@ -49,14 +51,14 @@ The canonical dataset is generated once and shared by all ML models. This makes 
 
 The canonical generator is **not based on the UIUC coordinate database** and does **not train on the fixed-Re Kanakaero dataset**.
 
-AeroSandbox's bundled airfoil database is used only as the source population for learning a statistical distribution of Kulfan parameters. The source airfoils are converted to Kulfan representations and used to calculate the mean/covariance of the geometry population. New synthetic airfoils are then sampled from that distribution.
+AeroSandbox's bundled aerofoil database is used only as the source population for learning a statistical distribution of Kulfan parameters. The source aerofoils are converted to Kulfan representations and used to calculate the mean/covariance of the geometry population. New synthetic aerofoils are then sampled from that distribution.
 
-The generator combines randomly selected parent airfoils using convex random weights, adds covariance-based perturbations, and applies random scaling. It then samples operating conditions and runs XFOIL. Reynolds number is sampled stochastically rather than selected from a fixed Reynolds-number list.
+The generator combines randomly selected parent aerofoils using convex random weights, adds covariance-based perturbations, and applies random scaling. It then samples operating conditions and runs XFOIL. Reynolds number is sampled stochastically rather than selected from a fixed Reynolds-number list.
 
 ## Repository structure
 
 ```text
-ml-aerofoil-predictor/
+aeris/
 ├── src/airfoil_ml/
 │   ├── training_data_generation.py  # canonical Kulfan + XFOIL generator
 │   ├── training.py                  # model training orchestration
@@ -88,10 +90,10 @@ The canonical implementation is `src/airfoil_ml/training_data_generation.py`; `s
 
 The generator:
 
-1. Loads airfoils bundled with AeroSandbox.
+1. Loads aerofoils bundled with AeroSandbox.
 2. Converts the source geometries into Kulfan representations.
 3. Computes the Kulfan population mean and covariance.
-4. Selects multiple parent airfoils for each synthetic case.
+4. Selects multiple parent aerofoils for each synthetic case.
 5. Forms a convex random weighted combination of the parents.
 6. Applies a covariance-based perturbation and random geometric scaling.
 7. Samples Reynolds number, angle of attack, Mach number and transition/turbulence conditions.
@@ -100,7 +102,7 @@ The generator:
 10. Writes resumable Parquet shards and records failed cases.
 11. Combines successful shards into one canonical training dataset.
 
-The current default configuration uses three parent airfoils, a seven-point alpha grid from -15 to +15 degrees with shared random jitter, a log-normal Reynolds distribution centred on log10(Re)=5.5 with sigma 1.5, Mach 0, and up to 200 XFOIL iterations per case. These are configurable defaults.
+The current default configuration uses three parent aerofoils, a seven-point alpha grid from -15 to +15 degrees with shared random jitter, a log-normal Reynolds distribution centred on log10(Re)=5.5 with sigma 1.5, Mach 0, and up to 200 XFOIL iterations per case. These are configurable defaults.
 
 Generate data with:
 
@@ -182,7 +184,7 @@ geometry + flow conditions
           aerodynamic outputs
 ```
 
-This model tests whether a conventional neural network can learn the non-linear mapping between airfoil shape, operating conditions and aerodynamic behaviour.
+This model tests whether a conventional neural network can learn the non-linear mapping between aerofoil shape, operating conditions and aerodynamic behaviour.
 
 ### 4. Histogram Gradient Boosting
 
@@ -235,9 +237,9 @@ This allows the project to investigate:
 
 The training pipeline constructs the input features and applies scaling fitted only on the training partition. The same preprocessing and target definitions are used for each candidate model as far as the model implementation permits.
 
-Rows are split **by airfoil identity**, not independently by operating point. Therefore, all operating conditions belonging to a generated airfoil remain in the same train, validation or test partition.
+Rows are split **by aerofoil identity**, not independently by operating point. Therefore, all operating conditions belonging to a generated aerofoil remain in the same train, validation or test partition.
 
-This prevents leakage such as training on one angle of attack for an airfoil and testing on another angle of attack for the same geometry.
+This prevents leakage such as training on one angle of attack for an aerofoil and testing on another angle of attack for the same geometry.
 
 ## Evaluation
 
@@ -247,7 +249,7 @@ The evaluation pipeline compares models using metrics including:
 - RMSE
 - R²
 
-Metrics are calculated for the principal aerodynamic targets and can be analysed against angle of attack, Reynolds number, airfoil identity and other operating regimes. Parity plots and error-analysis outputs identify where each model succeeds or fails.
+Metrics are calculated for the principal aerodynamic targets and can be analysed against angle of attack, Reynolds number, aerofoil identity and other operating regimes. Parity plots and error-analysis outputs identify where each model succeeds or fails.
 
 Run:
 
