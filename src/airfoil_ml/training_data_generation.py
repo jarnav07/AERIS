@@ -1,7 +1,6 @@
 """Reproducible stochastic training-data generation for the airfoil surrogate.
 
-The generator follows the stochastic geometry/operating-point strategy used by
-NeuralFoil. It uses Kulfan geometries derived from aerosandbox's built-in
+The generator follows a stochastic geometry/operating-point . It uses Kulfan geometries derived from aerosandbox's built-in
 airfoil database to form a covariance matrix for random sampling.
 
 Parallel processing and sharding are used to support large-scale generation
