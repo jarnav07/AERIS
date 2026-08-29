@@ -223,7 +223,8 @@ def generate_training_dataset(
     workers: int = 1,
     xfoil_executable: str = "xfoil",
     config: TrainingDataConfig = TrainingDataConfig(),
-    resume: bool = False
+    resume: bool = False,
+    include_cylinder_augmentation: bool = True
 ) -> dict[str, object]:
     if n_cases <= 0:
         raise ValueError("n_cases must be positive")
@@ -288,15 +289,50 @@ def generate_training_dataset(
         raise RuntimeError("No usable XFOIL training vectors were generated")
         
     combined = pd.concat(all_frames, ignore_index=True)
+    
+    if include_cylinder_augmentation:
+        cylinder_frame = generate_cylinder_rows()
+        combined = pd.concat([combined, cylinder_frame], ignore_index=True)
+        
     output_csv = output_dir / "training_data.csv"
     combined.to_csv(output_csv, index=False)
     
     manifest = {
         "generator": "training_data_generation", "seed": seed, "requested_cases": n_cases,
-        "successful_vectors": len(combined), "successful_airfoils": int(combined.airfoil_id.nunique()),
+        "successful_vectors": int(combined[combined["airfoil_id"] != "CYLINDER"].shape[0]),
+        "successful_airfoils": int(combined[combined["airfoil_id"] != "CYLINDER"]["airfoil_id"].nunique()),
+        "cylinder_rows": int((combined["airfoil_id"] == "CYLINDER").sum()),
         "failed_cases": failures, "training_vector_size": TRAINING_VECTOR_SIZE,
         "boundary_layer_points_per_surface": N_BL_POINTS, "database_size": len(database.airfoils),
         "sampling_config": asdict(config),
     }
     output_csv.with_suffix(".provenance.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
+
+_CYLINDER_CONFIDENCE = 0.1
+
+def generate_cylinder_rows(
+    reynolds_values: tuple[float, ...] = (1e4, 1e5, 1e6),
+    alpha_values: tuple[float, ...] = tuple(np.linspace(-180.0, 180.0, 37)),
+) -> pd.DataFrame:
+    records = []
+    kulfan_zeros = np.zeros(18, dtype=np.float32)  # 8+8+1+1
+
+    for reynolds in reynolds_values:
+        for alpha in alpha_values:
+            vector = np.concatenate([
+                kulfan_zeros,
+                np.array([
+                    float(alpha), float(reynolds), 0.0, 9.0,
+                    1.0, 1.0,
+                    _CYLINDER_CONFIDENCE,
+                    0.0, 1.0, 0.0,
+                    0.5, 0.5,
+                ], dtype=np.float32),
+                np.zeros(6 * N_BL_POINTS, dtype=np.float32),
+            ])
+            records.append(vector)
+
+    frame = pd.DataFrame(np.vstack(records), columns=TRAINING_VECTOR_COLUMNS)
+    frame.insert(0, "airfoil_id", "CYLINDER")
+    return frame
