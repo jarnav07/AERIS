@@ -6,7 +6,6 @@ through its documented batch-command interface.
 """
 from __future__ import annotations
 
-import re
 import subprocess
 from pathlib import Path
 
@@ -89,8 +88,7 @@ def _build_commands(
     xtr_lower: float,
     iterations: int,
 ) -> str:
-    # XFOIL's viscous solution is path-dependent. Start at alpha=0, then
-    # march outward on each side, using INIT before switching direction.
+    """Build a deterministic XFOIL batch session."""
     positive = sorted(float(a) for a in alphas if a > 0.0)
     negative = sorted((float(a) for a in alphas if a < 0.0), reverse=True)
     zero_requested = any(np.isclose(alphas, 0.0, atol=1e-10))
@@ -112,12 +110,11 @@ def _build_commands(
     ]
 
     def add_alpha(alpha: float) -> None:
-        dump_file = dump_files[alpha]
-        commands.extend([f"ALFA {alpha:.12g}", f"DUMP {dump_file.name}"])
+        commands.extend([f"ALFA {alpha:.12g}", f"DUMP {dump_files[alpha].name}"])
 
     # Establish a benign viscous solution at zero degrees even when zero is
     # not one of the requested training points.
-    commands.extend(["ALFA 0.0"])
+    commands.append("ALFA 0.0")
     if zero_requested:
         add_alpha(0.0)
 
@@ -125,7 +122,7 @@ def _build_commands(
         add_alpha(alpha)
 
     if negative:
-        commands.extend(["INIT"])
+        commands.append("INIT")
         for alpha in negative:
             add_alpha(alpha)
 
@@ -180,9 +177,13 @@ def run_xfoil_case(
     for alpha, path in dump_files.items():
         if path.exists():
             try:
-                dumps[alpha] = _parse_dump(path)
+                frame = _parse_dump(path)
             except ValueError:
                 continue
+            dumps[alpha] = frame
+            # XFOIL writes polar alpha values at finite precision; retain a
+            # rounded alias so the worker can match the polar row to its dump.
+            dumps[float(f"{alpha:.3f}")] = frame
 
     if polar.empty:
         tail = result.stdout[-4000:].strip()
