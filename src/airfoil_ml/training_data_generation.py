@@ -172,7 +172,11 @@ def _analyse_airfoil_worker(
             )
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
-                outputs = xf.alpha(np.asarray(operating["alphas"], dtype=float))
+                requested_alphas = np.asarray(operating["alphas"], dtype=float)
+                # XFOIL's viscous solver is much more robust when it starts near
+                # zero angle of attack and then continues toward higher |alpha|.
+                solve_alphas = requested_alphas[np.argsort(np.abs(requested_alphas))]
+                outputs = xf.alpha(solve_alphas)
         except Exception as e:
             return airfoil_id, [], str(e)
 
@@ -258,9 +262,11 @@ def generate_training_dataset(
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = []
             for airfoil_id, airfoil, operating in cases_to_run:
-                # XFOIL uses xvfb automatically if DISPLAY is not set
-                if not os.environ.get("DISPLAY") and shutil.which("xvfb-run") and not xfoil_executable.startswith("xvfb-run"):
-                    cmd = f"xvfb-run -a {xfoil_executable}"
+                # On headless machines use the repository's XFOIL wrapper when available.
+                # AeroSandbox expects xfoil_command to be a single executable, not a
+                # compound command such as "xvfb-run -a xfoil".
+                if not os.environ.get("DISPLAY") and shutil.which("xfoil-aeris"):
+                    cmd = shutil.which("xfoil-aeris")
                 else:
                     cmd = xfoil_executable
                 futures.append(executor.submit(
