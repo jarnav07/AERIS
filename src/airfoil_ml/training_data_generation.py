@@ -173,9 +173,9 @@ def _analyse_airfoil_worker(
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
                 requested_alphas = np.asarray(operating["alphas"], dtype=float)
-                # Start near zero angle of attack, then continue toward higher |alpha|.
-                solve_alphas = requested_alphas[np.argsort(np.abs(requested_alphas))]
-                outputs = xf.alpha(solve_alphas)
+                # XFOIL's viscous solver is path-dependent. Explicitly anchor
+                # the sweep at alpha=0 before marching toward +/- alpha.
+                outputs = xf.alpha(requested_alphas, start_at=0.0)
         except Exception as e:
             return airfoil_id, [], str(e)
 
@@ -256,7 +256,6 @@ def generate_training_dataset(
             existing_shards.add(shard.stem)
 
     cases_to_run = [c for c in cases if c[0] not in existing_shards]
-
     failures = []
 
     if cases_to_run:
@@ -297,7 +296,6 @@ def generate_training_dataset(
         )
 
     combined = pd.concat(all_frames, ignore_index=True)
-
     if include_cylinder_augmentation:
         cylinder_frame = generate_cylinder_rows()
         combined = pd.concat([combined, cylinder_frame], ignore_index=True)
