@@ -90,6 +90,15 @@ def load_kulfan_database() -> KulfanDatabase:
     return KulfanDatabase(airfoils, np.mean(kulfans, axis=0), np.cov(kulfans, rowvar=False))
 
 
+# Patch aerosandbox.XFoil to disable graphics by default to prevent display crashes
+# This is required for headless environments where XFOIL might abort with "Cannot open display"
+_original_run_xfoil = asb.XFoil._run_xfoil
+def _patched_run_xfoil(self, run_command: str, read_bl_data_from: str | type[None] = None) -> dict[str, object]:
+    run_command = "PLOP\nG\n\n" + run_command
+    return _original_run_xfoil(self, run_command, read_bl_data_from)
+asb.XFoil._run_xfoil = _patched_run_xfoil
+
+
 def sample_airfoil(database: KulfanDatabase, rng: np.random.Generator, config: TrainingDataConfig) -> asb.KulfanAirfoil:
     cuts = np.sort(rng.random(config.n_airfoils_to_combine - 1))
     weights = np.diff(np.concatenate(([0.0], cuts, [1.0])))
@@ -101,12 +110,24 @@ def sample_airfoil(database: KulfanDatabase, rng: np.random.Generator, config: T
         leading_edge_weight=float(np.dot(weights, [p.leading_edge_weight for p in parents])),
         TE_thickness=float(np.dot(weights, [p.TE_thickness for p in parents])),
     )
-    airfoil = airfoil.scale(1.0, float(rng.lognormal(0.0, config.scale_log_sigma)))
-    deviation = rng.multivariate_normal(np.zeros_like(database.mean), database.covariance)
+    
+    # Resample deviation until upper weights are strictly > lower weights
+    # to avoid severely self-intersecting airfoils that crash XFOIL.
+    for _ in range(100):
+        deviation = rng.multivariate_normal(np.zeros_like(database.mean), database.covariance)
+        if np.all((airfoil.upper_weights + deviation[:8]) > (airfoil.lower_weights + deviation[8:16])):
+            break
+            
     airfoil.upper_weights += deviation[:8]
     airfoil.lower_weights += deviation[8:16]
     airfoil.leading_edge_weight += deviation[16]
     airfoil.TE_thickness += deviation[17]
+    
+    # Ensure TE thickness is non-negative to avoid crossed trailing edges
+    airfoil.TE_thickness = max(0.0, airfoil.TE_thickness)
+    
+    # Scale after adding deviation so the deviation is applied in the normalized unscaled space
+    airfoil = airfoil.scale(1.0, float(rng.lognormal(0.0, config.scale_log_sigma)))
     return airfoil
 
 
