@@ -173,8 +173,7 @@ def _analyse_airfoil_worker(
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
                 requested_alphas = np.asarray(operating["alphas"], dtype=float)
-                # XFOIL's viscous solver is much more robust when it starts near
-                # zero angle of attack and then continues toward higher |alpha|.
+                # Start near zero angle of attack, then continue toward higher |alpha|.
                 solve_alphas = requested_alphas[np.argsort(np.abs(requested_alphas))]
                 outputs = xf.alpha(solve_alphas)
         except Exception as e:
@@ -185,9 +184,12 @@ def _analyse_airfoil_worker(
         return airfoil_id, [], "no converged/usable XFOIL points"
 
     vectors = []
-    for requested_alpha in np.asarray(operating["alphas"], dtype=float):
+    interpolation_failures = []
+    requested_alphas = np.asarray(operating["alphas"], dtype=float)
+    for requested_alpha in requested_alphas:
         differences = np.abs(returned_alphas - requested_alpha)
         if np.min(differences) > 1e-3:
+            interpolation_failures.append(f"alpha {requested_alpha:.3f}: not returned by XFOIL")
             continue
         index = int(np.argmin(differences))
         try:
@@ -196,7 +198,8 @@ def _analyse_airfoil_worker(
                 _interpolate_surface(upper, "theta"), _interpolate_surface(upper, "H"), _interpolate_surface(upper, "ue/vinf"),
                 _interpolate_surface(lower, "theta"), _interpolate_surface(lower, "H"), _interpolate_surface(lower, "ue/vinf"),
             ]
-        except (IndexError, KeyError, TypeError, ValueError):
+        except (IndexError, KeyError, TypeError, ValueError) as e:
+            interpolation_failures.append(f"alpha {requested_alpha:.3f}: {e}")
             continue
         vector = np.concatenate([
             _kulfan_vector(airfoil),
@@ -211,10 +214,11 @@ def _analyse_airfoil_worker(
         if len(vector) != TRAINING_VECTOR_SIZE:
             return airfoil_id, [], f"unexpected training-vector size: {len(vector)}"
         vectors.append(vector)
-    
+
     if not vectors:
-        return airfoil_id, [], "no boundary layer points could be interpolated"
-        
+        detail = "; ".join(interpolation_failures[:4])
+        return airfoil_id, [], f"no boundary layer points could be interpolated ({detail})"
+
     return airfoil_id, vectors, None
 
 
@@ -231,15 +235,14 @@ def generate_training_dataset(
 ) -> dict[str, object]:
     if n_cases <= 0:
         raise ValueError("n_cases must be positive")
-    
+
     output_dir = Path(output_dir)
     shards_dir = output_dir / "shards"
     shards_dir.mkdir(parents=True, exist_ok=True)
-    
+
     rng = np.random.default_rng(seed)
     database = load_kulfan_database()
 
-    # Pre-generate parameters to ensure reproducibility regardless of workers
     cases = []
     for case_index in range(n_cases):
         airfoil = sample_airfoil(database, rng, config)
@@ -253,18 +256,13 @@ def generate_training_dataset(
             existing_shards.add(shard.stem)
 
     cases_to_run = [c for c in cases if c[0] not in existing_shards]
-    
+
     failures = []
-    total_vectors = 0
-    total_airfoils = 0
 
     if cases_to_run:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = []
             for airfoil_id, airfoil, operating in cases_to_run:
-                # On headless machines use the repository's XFOIL wrapper when available.
-                # AeroSandbox expects xfoil_command to be a single executable, not a
-                # compound command such as "xvfb-run -a xfoil".
                 if not os.environ.get("DISPLAY") and shutil.which("xfoil-aeris"):
                     cmd = shutil.which("xfoil-aeris")
                 else:
@@ -272,7 +270,7 @@ def generate_training_dataset(
                 futures.append(executor.submit(
                     _analyse_airfoil_worker, airfoil, operating, config, cmd, airfoil_id, output_dir
                 ))
-            
+
             with tqdm(total=len(cases_to_run), desc="Generating data") as pbar:
                 for future in as_completed(futures):
                     airfoil_id, vectors, error = future.result()
@@ -285,23 +283,28 @@ def generate_training_dataset(
                         frame.to_parquet(shard_path, index=False)
                     pbar.update(1)
 
-    # Combine shards
     all_frames = []
     for shard in tqdm(sorted(shards_dir.glob("*.parquet")), desc="Combining shards"):
         all_frames.append(pd.read_parquet(shard))
-    
+
     if not all_frames:
-        raise RuntimeError("No usable XFOIL training vectors were generated")
-        
+        failure_preview = "\n".join(
+            f"  {item['airfoil_id']}: {item['error']}" for item in failures[:10]
+        )
+        raise RuntimeError(
+            "No usable XFOIL training vectors were generated.\n"
+            f"Failure details:\n{failure_preview or 'No worker failures were recorded.'}"
+        )
+
     combined = pd.concat(all_frames, ignore_index=True)
-    
+
     if include_cylinder_augmentation:
         cylinder_frame = generate_cylinder_rows()
         combined = pd.concat([combined, cylinder_frame], ignore_index=True)
-        
+
     output_csv = output_dir / "training_data.csv"
     combined.to_csv(output_csv, index=False)
-    
+
     manifest = {
         "generator": "training_data_generation", "seed": seed, "requested_cases": n_cases,
         "successful_vectors": int(combined[combined["airfoil_id"] != "CYLINDER"].shape[0]),
@@ -316,12 +319,13 @@ def generate_training_dataset(
 
 _CYLINDER_CONFIDENCE = 0.1
 
+
 def generate_cylinder_rows(
     reynolds_values: tuple[float, ...] = (1e4, 1e5, 1e6),
     alpha_values: tuple[float, ...] = tuple(np.linspace(-180.0, 180.0, 37)),
 ) -> pd.DataFrame:
     records = []
-    kulfan_zeros = np.zeros(18, dtype=np.float32)  # 8+8+1+1
+    kulfan_zeros = np.zeros(18, dtype=np.float32)
 
     for reynolds in reynolds_values:
         for alpha in alpha_values:
