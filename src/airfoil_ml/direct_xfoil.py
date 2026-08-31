@@ -26,10 +26,10 @@ def _parse_polar(path: Path) -> pd.DataFrame:
 
     for line in path.read_text(errors="replace").splitlines():
         parts = line.split()
-        if len(parts) != 7:
+        if len(parts) < 7:
             continue
         try:
-            rows.append([float(value) for value in parts])
+            rows.append([float(value) for value in parts[:7]])
         except ValueError:
             continue
 
@@ -171,7 +171,7 @@ def _build_commands(
     def add_alpha(alpha: float) -> None:
         # DUMP must follow a converged ALFA command. XFOIL writes the current
         # boundary-layer solution to this file without changing the polar.
-        commands.extend([f"ALFA {alpha:.12g}", f"DUMP {dump_files[alpha].name}"])
+        commands.extend([f"ALFA {alpha:.12g}", "DUMP", dump_files[alpha].name])
 
     # Establish a benign viscous solution before moving away from alpha=0.
     commands.append("ALFA 0.0")
