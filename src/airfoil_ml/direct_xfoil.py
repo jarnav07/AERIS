@@ -114,12 +114,15 @@ def _run_process(
     """Run XFOIL, automatically using Xvfb when no display is available."""
     executable_path = shutil.which(executable) if not Path(executable).is_absolute() else executable
     if executable_path is None:
-        print("POLAR FILE CONTENT:\n", polar_file.read_text()); raise RuntimeError(f"XFOIL executable not found: {executable}")
+        raise RuntimeError(f"XFOIL executable not found: {executable}")
 
     command = [executable_path]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
         command = ["xvfb-run", "--auto-servernum", executable_path]
 
+    env = os.environ.copy()
+    env["GFORTRAN_UNBUFFERED_ALL"] = "1"
+    
     return subprocess.run(
         command,
         input=commands,
@@ -129,6 +132,7 @@ def _run_process(
         cwd=cwd,
         timeout=timeout,
         check=False,
+        env=env,
     )
 
 
@@ -147,7 +151,6 @@ def _build_commands(
     """Build a deterministic XFOIL batch session."""
     positive = sorted(float(a) for a in alphas if a > 0.0)
     negative = sorted((float(a) for a in alphas if a < 0.0), reverse=True)
-    zero_requested = any(np.isclose(alphas, 0.0, atol=1e-10))
 
     commands = [
         "PLOP",
@@ -170,17 +173,18 @@ def _build_commands(
 
     def add_alpha(alpha: float) -> None:
         # DUMP must follow a converged ALFA command. XFOIL writes the current
-        # boundary-layer solution to this file without changing the polar.
+        # boundary-layer solution to this file. XFOIL prompts for the filename.
+        # Note: We skip dumping alpha=0.0 because the stagnation point singularity
+        # triggers a SIGFPE divide-by-zero in XFOIL 6.99's DUMP subroutine.
         commands.extend([
-            f"ALFA {alpha:.12g}", 
-            "DUMP", dump_files[alpha].name,
-            "PWRT", "polar_sync.txt", "Y"
+            f"ALFA {alpha:.12g}",
+            "DUMP",
+            dump_files[alpha].name
         ])
 
     # Establish a benign viscous solution before moving away from alpha=0.
     commands.append("ALFA 0.0")
-    if zero_requested:
-        add_alpha(0.0)
+    # We do NOT dump alpha=0.0 to avoid the SIGFPE bug.
 
     for alpha in positive:
         add_alpha(alpha)
@@ -239,11 +243,7 @@ def run_xfoil_case(
     except OSError as exc:
         raise RuntimeError(f"Could not launch XFOIL executable '{executable}': {exc}") from exc
 
-    polar_sync_file = working_directory / "polar_sync.txt"
-    if polar_sync_file.exists():
-        polar = _parse_polar(polar_sync_file)
-    else:
-        polar = _parse_polar(polar_file)
+    polar = _parse_polar(polar_file)
 
     dumps: dict[float, pd.DataFrame] = {}
     for alpha, path in dump_files.items():
