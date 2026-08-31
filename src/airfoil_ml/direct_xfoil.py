@@ -114,7 +114,7 @@ def _run_process(
     """Run XFOIL, automatically using Xvfb when no display is available."""
     executable_path = shutil.which(executable) if not Path(executable).is_absolute() else executable
     if executable_path is None:
-        raise RuntimeError(f"XFOIL executable not found: {executable}")
+        print("POLAR FILE CONTENT:\n", polar_file.read_text()); raise RuntimeError(f"XFOIL executable not found: {executable}")
 
     command = [executable_path]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
@@ -150,6 +150,9 @@ def _build_commands(
     zero_requested = any(np.isclose(alphas, 0.0, atol=1e-10))
 
     commands = [
+        "PLOP",
+        "G",
+        "",
         f"LOAD {airfoil_file.name}",
         "PANE",
         "OPER",
@@ -228,9 +231,9 @@ def run_xfoil_case(
     try:
         result = _run_process(executable, commands, working_directory, timeout)
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"XFOIL timed out after {timeout}s") from exc
+        print("POLAR FILE CONTENT:\n", polar_file.read_text()); raise RuntimeError(f"XFOIL timed out after {timeout}s") from exc
     except OSError as exc:
-        raise RuntimeError(f"Could not launch XFOIL executable '{executable}': {exc}") from exc
+        print("POLAR FILE CONTENT:\n", polar_file.read_text()); raise RuntimeError(f"Could not launch XFOIL executable '{executable}': {exc}") from exc
 
     polar = _parse_polar(polar_file)
     dumps: dict[float, pd.DataFrame] = {}
@@ -246,7 +249,7 @@ def run_xfoil_case(
 
     if polar.empty:
         tail = result.stdout[-4000:].strip()
-        raise RuntimeError(
+        print("POLAR FILE CONTENT:\n", polar_file.read_text()); raise RuntimeError(
             f"XFOIL produced no usable polar points (return code {result.returncode}).\n{tail}"
         )
 
