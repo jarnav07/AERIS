@@ -171,7 +171,11 @@ def _build_commands(
     def add_alpha(alpha: float) -> None:
         # DUMP must follow a converged ALFA command. XFOIL writes the current
         # boundary-layer solution to this file without changing the polar.
-        commands.extend([f"ALFA {alpha:.12g}", "DUMP", dump_files[alpha].name])
+        commands.extend([
+            f"ALFA {alpha:.12g}", 
+            "DUMP", dump_files[alpha].name,
+            "PWRT", "polar_sync.txt", "Y"
+        ])
 
     # Establish a benign viscous solution before moving away from alpha=0.
     commands.append("ALFA 0.0")
@@ -231,11 +235,16 @@ def run_xfoil_case(
     try:
         result = _run_process(executable, commands, working_directory, timeout)
     except subprocess.TimeoutExpired as exc:
-        print("POLAR FILE CONTENT:\n", polar_file.read_text()); raise RuntimeError(f"XFOIL timed out after {timeout}s") from exc
+        raise RuntimeError("XFOIL execution timed out.") from exc
     except OSError as exc:
-        print("POLAR FILE CONTENT:\n", polar_file.read_text()); raise RuntimeError(f"Could not launch XFOIL executable '{executable}': {exc}") from exc
+        raise RuntimeError(f"Could not launch XFOIL executable '{executable}': {exc}") from exc
 
-    polar = _parse_polar(polar_file)
+    polar_sync_file = working_directory / "polar_sync.txt"
+    if polar_sync_file.exists():
+        polar = _parse_polar(polar_sync_file)
+    else:
+        polar = _parse_polar(polar_file)
+
     dumps: dict[float, pd.DataFrame] = {}
     for alpha, path in dump_files.items():
         if not path.exists():
@@ -249,7 +258,7 @@ def run_xfoil_case(
 
     if polar.empty:
         tail = result.stdout[-4000:].strip()
-        print("POLAR FILE CONTENT:\n", polar_file.read_text()); raise RuntimeError(
+        raise RuntimeError(
             f"XFOIL produced no usable polar points (return code {result.returncode}).\n{tail}"
         )
 
