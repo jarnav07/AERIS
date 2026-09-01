@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,45 @@ import pandas as pd
 
 
 _POLAR_COLUMNS = ["alpha", "CL", "CD", "CDp", "CM", "Top_Xtr", "Bot_Xtr"]
+
+# Debian/Ubuntu's packaged xfoil binary is built with gfortran's
+# -ffpe-trap=invalid,zero,overflow, so its runtime calls _gfortran_set_fpe()
+# at startup to unmask hardware floating-point exceptions. That makes XFOIL
+# crash with SIGFPE on ordinary IEEE div-by-zero/invalid results (e.g. a
+# zero boundary-layer momentum thickness at a stagnation point) that
+# upstream XFOIL treats as benign NaN/Inf and simply reports as a warning.
+# We override _gfortran_set_fpe with a no-op via LD_PRELOAD symbol
+# interposition so the trap is never (re-)enabled.
+_FPE_SHIM_SOURCE = """\
+void _gfortran_set_fpe(int mode) {
+    (void)mode;
+}
+"""
+
+
+def _fpe_shim_path() -> str | None:
+    shim = Path(tempfile.gettempdir()) / "aeris_xfoil_nofpe.so"
+    if shim.exists():
+        return str(shim)
+
+    compiler = shutil.which("gcc") or shutil.which("cc")
+    if compiler is None:
+        return None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "nofpe.c"
+        source.write_text(_FPE_SHIM_SOURCE, encoding="utf-8")
+        built = Path(tmp) / "nofpe.so"
+        result = subprocess.run(
+            [compiler, "-shared", "-fPIC", "-o", str(built), str(source)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or not built.exists():
+            return None
+        os.replace(built, shim)
+
+    return str(shim)
 
 
 def _parse_polar(path: Path) -> pd.DataFrame:
@@ -122,7 +162,12 @@ def _run_process(
 
     env = os.environ.copy()
     env["GFORTRAN_UNBUFFERED_ALL"] = "1"
-    
+
+    shim = _fpe_shim_path()
+    if shim is not None:
+        existing_preload = env.get("LD_PRELOAD")
+        env["LD_PRELOAD"] = f"{shim}:{existing_preload}" if existing_preload else shim
+
     return subprocess.run(
         command,
         input=commands,
