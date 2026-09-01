@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -168,17 +169,35 @@ def _run_process(
         existing_preload = env.get("LD_PRELOAD")
         env["LD_PRELOAD"] = f"{shim}:{existing_preload}" if existing_preload else shim
 
-    return subprocess.run(
+    # xvfb-run is a shell script: it spawns Xvfb and the real xfoil binary as
+    # children of its own, so a plain subprocess.run(..., timeout=...) kill
+    # only reaches the xvfb-run shell itself. If xfoil hangs (observed: it
+    # can sit spinning at 100% CPU indefinitely rather than exiting), the
+    # orphaned xfoil process is reparented to init and survives the timeout
+    # forever, permanently stealing a CPU core from the worker pool. Running
+    # in a new session puts the whole xvfb-run/Xvfb/xfoil tree in one process
+    # group so a timeout can kill all of it at once.
+    process = subprocess.Popen(
         command,
-        input=commands,
-        text=True,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        text=True,
         cwd=cwd,
-        timeout=timeout,
-        check=False,
         env=env,
+        start_new_session=True,
     )
+    try:
+        stdout, _ = process.communicate(input=commands, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, _ = process.communicate()
+        raise subprocess.TimeoutExpired(command, timeout, output=stdout)
+
+    return subprocess.CompletedProcess(command, process.returncode, stdout=stdout)
 
 
 def _build_commands(
