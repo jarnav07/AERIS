@@ -54,7 +54,11 @@ class TrainingDataConfig:
     alpha_jitter_uniform: float = 2.5
     alpha_jitter_normal_sigma: float = 2.5
     log10_re_mean: float = 5.5
-    log10_re_sigma: float = 1.5
+    # 3-sigma tail stays above Re~1800 (real airfoils rarely operate below
+    # Re~1e4); the previous sigma=1.5 let ~1-2% of samples draw Re<1000,
+    # which produced non-physical laminar-separation-bubble H spikes (up to
+    # ~130) in the boundary-layer targets.
+    log10_re_sigma: float = 0.75
     n_crit_min: float = 0.0
     n_crit_max: float = 18.0
     forced_transition_probability: float = 0.8
