@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Evaluate saved model predictions and generate research plots."""
+"""Evaluate a trained canonical model on its held-out test split and generate research plots.
+
+Prefer: ``airfoil-ml evaluate``.
+"""
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+import json
+
+from airfoil_ml.training import evaluate_kulfan_model
 
 
 def main() -> None:
@@ -14,13 +19,13 @@ def main() -> None:
     parser.add_argument("--output", default="results/evaluation")
     args = parser.parse_args()
 
-    # Keep evaluation orchestration in the package; this script is only an entry point.
-    from airfoil_ml.training import load_model_bundle
-    from airfoil_ml.evaluation import save_evaluation_plots
-
-    model_dir = Path(args.model_dir)
-    bundle = load_model_bundle(model_dir / args.model)
-    save_evaluation_plots(bundle, args.csv, args.output)
+    metrics = evaluate_kulfan_model(
+        csv_path=args.csv,
+        model_dir=args.model_dir,
+        model_name=args.model,
+        output_dir=args.output,
+    )
+    print(json.dumps(metrics, indent=2))
 
 
 if __name__ == "__main__":
