@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+import aerosandbox as asb
 import joblib
 import numpy as np
 import pandas as pd
@@ -16,22 +17,87 @@ from .evaluation import regression_metrics, save_evaluation_plots
 from .features import FeaturePreprocessor
 from .models import ModelConfig, make_models
 
+GEOMETRY_FEATURE_COLUMNS = [
+    "geom_max_thickness", "geom_max_camber", "geom_le_radius", "geom_te_angle", "geom_area", "geom_perimeter",
+]
 KULFAN_FEATURE_COLUMNS = [
     *[f"kulfan_upper_{i}" for i in range(8)],
     *[f"kulfan_lower_{i}" for i in range(8)],
     "kulfan_LE_weight", "kulfan_TE_thickness",
     "alpha", "Re", "mach", "n_crit", "xtr_upper", "xtr_lower",
+    *GEOMETRY_FEATURE_COLUMNS,
 ]
 RE_COLUMN_INDEX = KULFAN_FEATURE_COLUMNS.index("Re")
+_KULFAN_VECTOR_COLUMNS = [
+    *[f"kulfan_upper_{i}" for i in range(8)],
+    *[f"kulfan_lower_{i}" for i in range(8)],
+    "kulfan_LE_weight", "kulfan_TE_thickness",
+]
+
+
+def _geometry_features_for_airfoil(kulfan_row: np.ndarray) -> np.ndarray:
+    """Derive engineered geometry descriptors from one airfoil's 18 Kulfan coefficients.
+
+    These give the models a more direct aerodynamic signal (thickness, camber, LE
+    radius, TE angle, area, perimeter) than the raw CST basis coefficients, which are
+    a comparatively opaque geometric representation. Falls back to zeros for
+    degenerate geometry (e.g. the all-zero CYLINDER sanity-check airfoil, whose
+    zero-thickness shape makes AeroSandbox's LE_radius softness parameter invalid).
+    """
+    airfoil = asb.KulfanAirfoil(
+        name="_geom_feature_probe",
+        upper_weights=kulfan_row[0:8],
+        lower_weights=kulfan_row[8:16],
+        leading_edge_weight=kulfan_row[16],
+        TE_thickness=kulfan_row[17],
+    )
+    try:
+        return np.array([
+            float(airfoil.max_thickness()),
+            float(airfoil.max_camber()),
+            float(airfoil.LE_radius()),
+            float(airfoil.TE_angle()),
+            float(airfoil.area()),
+            float(airfoil.perimeter()),
+        ])
+    except Exception:
+        return np.zeros(len(GEOMETRY_FEATURE_COLUMNS))
+
+
+def add_geometry_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Attach engineered geometry columns, computed once per unique airfoil_id.
+
+    Geometry only depends on the Kulfan coefficients, which are constant across every
+    row (alpha/Re case) belonging to the same airfoil_id, so this dedupes before the
+    (comparatively expensive, ~0.5ms each) AeroSandbox geometry calls and broadcasts
+    the result back rather than recomputing per row.
+    """
+    if all(col in frame.columns for col in GEOMETRY_FEATURE_COLUMNS):
+        return frame
+
+    unique = frame.drop_duplicates(subset="airfoil_id")[["airfoil_id", *_KULFAN_VECTOR_COLUMNS]]
+    kulfan_matrix = unique[_KULFAN_VECTOR_COLUMNS].to_numpy(float)
+    geometry = np.stack([_geometry_features_for_airfoil(row) for row in kulfan_matrix])
+    geometry_by_airfoil = pd.DataFrame(geometry, columns=GEOMETRY_FEATURE_COLUMNS)
+    geometry_by_airfoil.insert(0, "airfoil_id", unique["airfoil_id"].to_numpy())
+
+    return frame.merge(geometry_by_airfoil, on="airfoil_id", how="left")
+
+
+_MIN_CD_FOR_LOG = 1e-6
 
 
 def _transform_labels(targets: np.ndarray, log_cd: bool) -> np.ndarray:
     """Transform training labels; log-Cd makes the model minimize relative Cd error."""
     transformed = np.asarray(targets, dtype=float).copy()
     if log_cd:
-        if np.any(transformed[:, 1] <= 0):
+        if np.any(transformed[:, 1] < -_MIN_CD_FOR_LOG):
             raise ValueError("Cd must be positive for log transformation")
-        transformed[:, 1] = np.log(transformed[:, 1])
+        # A handful of converged-but-vanishingly-low-drag XFOIL cases round to
+        # exactly 0.0 in the generated dataset (observed: 1 row out of 610k),
+        # which log(0) can't represent. Floor rather than error, since these are
+        # genuine near-zero-drag solutions, not corrupted data.
+        transformed[:, 1] = np.log(np.maximum(transformed[:, 1], _MIN_CD_FOR_LOG))
     return transformed
 
 
@@ -86,6 +152,7 @@ def train_from_kulfan_csv(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     frame = pd.read_csv(csv_path)
+    frame = add_geometry_features(frame)
     target_cols = _target_columns(frame)
 
     split = grouped_split_by_id(
@@ -202,6 +269,7 @@ def evaluate_kulfan_model(
         log_cd = bool(json.loads(config_path.read_text(encoding="utf-8"))["log_cd"]) if config_path.exists() else False
 
     frame = pd.read_csv(csv_path)
+    frame = add_geometry_features(frame)
     test_frame = frame[frame["airfoil_id"].astype(str).isin(test_airfoils)].reset_index(drop=True)
     if test_frame.empty:
         raise ValueError(f"none of the test airfoils recorded in {manifest_path} are present in {csv_path}")
