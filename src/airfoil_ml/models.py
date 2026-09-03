@@ -25,7 +25,17 @@ def make_models(config: ModelConfig | None = None) -> dict[str, Any]:
         "ridge": Ridge(alpha=1.0),
         "random_forest": RandomForestRegressor(
             n_estimators=250,
-            min_samples_leaf=2,
+            # min_samples_leaf=2 is fine for a handful of targets, but this
+            # model is trained multi-output against 197 targets (CL/CD/CM/
+            # Top_Xtr/Bot_Xtr + 192 boundary-layer columns): every leaf stores
+            # a per-target mean, so a near-unbounded leaf count at
+            # dataset-generation scale (hundreds of thousands of training
+            # rows) multiplies out to tens of GB across 250 trees and can
+            # exhaust host memory. min_samples_leaf=25 plus an explicit
+            # max_leaf_nodes cap bounds per-tree memory regardless of how
+            # large the training set grows.
+            min_samples_leaf=25,
+            max_leaf_nodes=5000,
             max_features=0.7,
             random_state=config.seed,
             n_jobs=-1,
