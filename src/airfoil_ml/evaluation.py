@@ -39,13 +39,30 @@ def error_by_condition(frame: pd.DataFrame, actual: np.ndarray, predicted: np.nd
     return errors.groupby("alpha_deg", as_index=False).mean(numeric_only=True)
 
 
-def save_evaluation_plots(frame: pd.DataFrame, actual: np.ndarray, predicted: np.ndarray, output_dir: str | Path, title_prefix: str = "Test") -> None:
+def save_evaluation_plots(
+    frame: pd.DataFrame,
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    output_dir: str | Path,
+    title_prefix: str = "Test",
+    max_polar_plots: int | None = None,
+) -> None:
     """Write parity, per-airfoil polar, and error-vs-condition plots for one model.
 
     ``frame`` must have one row per ``actual``/``predicted`` row and include
     ``airfoil_id``, ``alpha_deg``, ``reynolds``, ``cl`` and ``cd`` (the
     reference values plotted alongside predictions); ``actual``/``predicted``
     are ``(N, 3)`` arrays in ``cl, cd, cm`` order.
+
+    ``max_polar_plots`` caps how many distinct airfoils get individual polar
+    PNGs (one ``fig.savefig`` per airfoil) and how many go into the
+    ``error_by_airfoil`` bar chart. The default of ``None`` plots every test
+    airfoil, which is fine for the handful of airfoils in a small dataset but
+    does not scale: at the ~20k test airfoils a full generated-dataset run
+    produces, that loop takes on the order of hours per model and the bar
+    chart becomes an unreadable/slow one-bar-per-airfoil plot. Pass ``0`` to
+    skip both entirely, or a small int (e.g. 30) to sample that many airfoils
+    (fixed seed, so the sample is reproducible) for a quick spot-check.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,9 +78,21 @@ def save_evaluation_plots(frame: pd.DataFrame, actual: np.ndarray, predicted: np
         fig.savefig(output_dir / f"parity_{target}.png", dpi=180)
         plt.close(fig)
 
+    all_airfoil_ids = frame.airfoil_id.unique()
+    if max_polar_plots is None:
+        polar_airfoil_ids = set(all_airfoil_ids)
+    elif max_polar_plots <= 0:
+        polar_airfoil_ids = set()
+    else:
+        rng = np.random.default_rng(0)
+        sample_size = min(max_polar_plots, len(all_airfoil_ids))
+        polar_airfoil_ids = set(rng.choice(all_airfoil_ids, size=sample_size, replace=False))
+
     plot_frame = frame.copy()
     plot_frame["pred_cl"], plot_frame["pred_cd"], plot_frame["pred_cm"] = predicted.T
     for airfoil_id, group in plot_frame.groupby("airfoil_id"):
+        if airfoil_id not in polar_airfoil_ids:
+            continue
         group = group.sort_values("alpha_deg")
         fig, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
         for ax, target, label in zip(axes, ("cl", "cd", "ld"), ("$C_l$", "$C_d$", "$L/D$")):
@@ -106,6 +135,8 @@ def save_evaluation_plots(frame: pd.DataFrame, actual: np.ndarray, predicted: np
     by_airfoil = condition_errors.copy()
     by_airfoil["airfoil_id"] = frame.airfoil_id.to_numpy()
     by_airfoil = by_airfoil.groupby("airfoil_id", as_index=False).mean(numeric_only=True)
+    if max_polar_plots is not None and len(by_airfoil) > max(max_polar_plots, 1):
+        by_airfoil = by_airfoil.sample(n=max(max_polar_plots, 1), random_state=0).sort_values("airfoil_id")
     fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
     for ax, target in zip(axes, TARGETS):
         ax.bar(by_airfoil.airfoil_id, by_airfoil[f"{target}_abs_error"], color=colors[target])

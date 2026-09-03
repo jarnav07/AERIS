@@ -42,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--model-dir", default="models")
     evaluate.add_argument("--model", default="mlp")
     evaluate.add_argument("--output", default="results/evaluation")
+    evaluate.add_argument(
+        "--max-polar-plots",
+        type=int,
+        default=None,
+        help="cap on per-airfoil polar PNGs/error-by-airfoil bars; 0 skips them, unset plots every test airfoil",
+    )
 
     return parser
 
@@ -85,6 +91,7 @@ def main() -> None:
             model_dir=args.model_dir,
             model_name=args.model,
             output_dir=args.output,
+            max_polar_plots=args.max_polar_plots,
         )
 
     print(json.dumps(result, indent=2))

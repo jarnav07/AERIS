@@ -181,6 +181,7 @@ def evaluate_kulfan_model(
     model_name: str = "mlp",
     output_dir: str | Path = "results/evaluation",
     log_cd: bool | None = None,
+    max_polar_plots: int | None = None,
 ) -> dict[str, float]:
     """Evaluate a trained canonical-pipeline model and write parity/error plots.
 
@@ -218,6 +219,6 @@ def evaluate_kulfan_model(
 
     plot_frame = test_frame[["airfoil_id", "alpha", "Re"]].rename(columns={"alpha": "alpha_deg", "Re": "reynolds"})
     plot_frame["cl"], plot_frame["cd"], plot_frame["cm"] = test_y[:, 0], test_y[:, 1], test_y[:, 2]
-    save_evaluation_plots(plot_frame, test_y[:, :3], test_pred[:, :3], output_dir, title_prefix=model_name)
+    save_evaluation_plots(plot_frame, test_y[:, :3], test_pred[:, :3], output_dir, title_prefix=model_name, max_polar_plots=max_polar_plots)
 
     return metrics
