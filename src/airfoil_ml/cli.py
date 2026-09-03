@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .models import ModelConfig
 from .training_data_generation import TrainingDataConfig, generate_training_dataset
-from .training import train_from_kulfan_csv
+from .training import evaluate_kulfan_model, train_from_kulfan_csv
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--mlp-max-iter", type=int, default=600)
     train.add_argument("--only", nargs="+", default=None)
     train.add_argument("--log-cd", action="store_true")
+    train.add_argument("--test-airfoils", nargs="+", default=None, help="fixed set of airfoil_ids to hold out as the test partition")
 
     evaluate = sub.add_parser("evaluate", help="create evaluation plots")
     evaluate.add_argument("--csv", default="data/generated/training_data.csv")
@@ -72,14 +73,18 @@ def main() -> None:
             csv_path=args.csv,
             output_dir=args.output_dir,
             seed=args.seed,
+            test_airfoils=args.test_airfoils,
             model_config=config,
             only=args.only,
             log_cd=args.log_cd,
         )
     else:
-        raise NotImplementedError(
-            "Evaluation orchestration remains in the existing research modules; "
-            "use scripts/evaluate_models.py for now."
+        assert args.command == "evaluate"
+        result = evaluate_kulfan_model(
+            csv_path=args.csv,
+            model_dir=args.model_dir,
+            model_name=args.model,
+            output_dir=args.output,
         )
 
     print(json.dumps(result, indent=2))

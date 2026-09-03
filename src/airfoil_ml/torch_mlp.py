@@ -9,9 +9,10 @@ honestly against the tree and linear baselines inside a bounded job budget.
 
 The class deliberately mirrors the parts of the sklearn estimator API that the
 rest of the pipeline uses: ``fit(X, y)``, ``predict(X)``, and the optional
-``loss_curve_`` / ``validation_scores_`` attributes that ``train_all`` persists
-as history JSON. Inputs and targets are expected to be already standardised by
-the pipeline's ``FeaturePreprocessor``; this module does no scaling of its own.
+``loss_curve_`` / ``validation_scores_`` attributes that ``train_from_kulfan_csv``
+persists as history JSON. Inputs and targets are expected to be already
+standardised by the pipeline's ``FeaturePreprocessor``; this module does no
+scaling of its own.
 """
 
 from __future__ import annotations

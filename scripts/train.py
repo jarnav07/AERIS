@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--mlp-max-iter", type=int, default=600)
     parser.add_argument("--only", nargs="+", default=None)
     parser.add_argument("--log-cd", action="store_true")
+    parser.add_argument("--test-airfoils", nargs="+", default=None, help="fixed set of airfoil_ids to hold out as the test partition")
     args = parser.parse_args()
 
     config = ModelConfig(
@@ -32,6 +33,7 @@ def main() -> None:
         csv_path=args.csv,
         output_dir=args.output_dir,
         seed=args.seed,
+        test_airfoils=args.test_airfoils,
         model_config=config,
         only=args.only,
         log_cd=args.log_cd,

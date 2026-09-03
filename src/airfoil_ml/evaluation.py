@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -36,6 +40,13 @@ def error_by_condition(frame: pd.DataFrame, actual: np.ndarray, predicted: np.nd
 
 
 def save_evaluation_plots(frame: pd.DataFrame, actual: np.ndarray, predicted: np.ndarray, output_dir: str | Path, title_prefix: str = "Test") -> None:
+    """Write parity, per-airfoil polar, and error-vs-condition plots for one model.
+
+    ``frame`` must have one row per ``actual``/``predicted`` row and include
+    ``airfoil_id``, ``alpha_deg``, ``reynolds``, ``cl`` and ``cd`` (the
+    reference values plotted alongside predictions); ``actual``/``predicted``
+    are ``(N, 3)`` arrays in ``cl, cd, cm`` order.
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     colors = {"cl": "#176b87", "cd": "#d95f02", "cm": "#5e3c99"}

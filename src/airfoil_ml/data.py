@@ -49,38 +49,64 @@ class AeroDataset:
         results are directly comparable). The remaining identities are split
         into train/validation with the same grouped, leakage-safe logic.
         """
-        if test_fraction <= 0 or validation_fraction <= 0 or test_fraction + validation_fraction >= 1:
-            raise ValueError("fractions must be positive and sum to less than one")
-        all_ids = np.array(sorted(self.frame["airfoil_id"].astype(str).unique()))
-        if len(all_ids) < 3:
-            raise ValueError("at least three distinct airfoils are required for grouped splitting")
-        rng = np.random.default_rng(seed)
-        if test_airfoils is not None:
-            test_ids = np.array(sorted(set(str(a) for a in test_airfoils)))
-            unknown = set(test_ids) - set(all_ids)
-            if unknown:
-                raise ValueError(f"test airfoils not present in the dataset: {sorted(unknown)}")
-            remaining = np.array(sorted(set(all_ids) - set(test_ids)))
-            remaining = rng.permutation(remaining)
-            n_val = max(1, int(round(len(remaining) * validation_fraction)))
-            if n_val >= len(remaining):
-                n_val = 1
-            val_ids, train_ids = remaining[:n_val], remaining[n_val:]
-        else:
-            ids = rng.permutation(all_ids)
-            n_test = max(1, int(round(len(ids) * test_fraction)))
-            n_val = max(1, int(round(len(ids) * validation_fraction)))
-            if n_test + n_val >= len(ids):
-                n_test, n_val = 1, 1
-            test_ids, val_ids, train_ids = ids[:n_test], ids[n_test : n_test + n_val], ids[n_test + n_val :]
-        return {
-            "train": np.flatnonzero(self.frame.airfoil_id.astype(str).isin(train_ids)),
-            "validation": np.flatnonzero(self.frame.airfoil_id.astype(str).isin(val_ids)),
-            "test": np.flatnonzero(self.frame.airfoil_id.astype(str).isin(test_ids)),
-            "train_airfoils": train_ids,
-            "validation_airfoils": val_ids,
-            "test_airfoils": test_ids,
-        }
+        return grouped_split_by_id(
+            self.frame,
+            test_fraction=test_fraction,
+            validation_fraction=validation_fraction,
+            seed=seed,
+            test_airfoils=test_airfoils,
+        )
+
+
+def grouped_split_by_id(
+    frame: pd.DataFrame,
+    test_fraction: float = 0.2,
+    validation_fraction: float = 0.2,
+    seed: int = 42,
+    test_airfoils: list[str] | None = None,
+    id_column: str = "airfoil_id",
+) -> dict[str, np.ndarray]:
+    """Split rows of ``frame`` by ``id_column`` so no identity spans multiple partitions.
+
+    Shared by every training pipeline in this package so grouped, leakage-safe
+    splitting logic is defined in exactly one place. When ``test_airfoils`` is
+    given, exactly those identities form the test partition (a fixed holdout,
+    e.g. reused from a previous experiment so results are directly comparable);
+    the remaining identities are split into train/validation with the same
+    logic.
+    """
+    if test_fraction <= 0 or validation_fraction <= 0 or test_fraction + validation_fraction >= 1:
+        raise ValueError("fractions must be positive and sum to less than one")
+    ids = frame[id_column].astype(str)
+    all_ids = np.array(sorted(ids.unique()))
+    if len(all_ids) < 3:
+        raise ValueError("at least three distinct airfoils are required for grouped splitting")
+    rng = np.random.default_rng(seed)
+    if test_airfoils is not None:
+        test_ids = np.array(sorted(set(str(a) for a in test_airfoils)))
+        unknown = set(test_ids) - set(all_ids)
+        if unknown:
+            raise ValueError(f"test airfoils not present in the dataset: {sorted(unknown)}")
+        remaining = rng.permutation(np.array(sorted(set(all_ids) - set(test_ids))))
+        n_val = max(1, int(round(len(remaining) * validation_fraction)))
+        if n_val >= len(remaining):
+            n_val = 1
+        val_ids, train_ids = remaining[:n_val], remaining[n_val:]
+    else:
+        permuted = rng.permutation(all_ids)
+        n_test = max(1, int(round(len(permuted) * test_fraction)))
+        n_val = max(1, int(round(len(permuted) * validation_fraction)))
+        if n_test + n_val >= len(permuted):
+            n_test, n_val = 1, 1
+        test_ids, val_ids, train_ids = permuted[:n_test], permuted[n_test : n_test + n_val], permuted[n_test + n_val :]
+    return {
+        "train": np.flatnonzero(ids.isin(train_ids)),
+        "validation": np.flatnonzero(ids.isin(val_ids)),
+        "test": np.flatnonzero(ids.isin(test_ids)),
+        "train_airfoils": train_ids,
+        "validation_airfoils": val_ids,
+        "test_airfoils": test_ids,
+    }
 
 
 def load_dataset(polar_csv: str | Path, coordinates_dir: str | Path, n_geometry_points: int = 100) -> AeroDataset:
