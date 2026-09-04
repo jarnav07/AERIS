@@ -4,6 +4,35 @@
 
 AERIS is a machine-learning framework for surrogate modelling of aerofoil aerodynamics. The project investigates whether machine-learning models can learn the mapping from aerofoil geometry and flow conditions to aerodynamic coefficients, using a single large XFOIL-generated dataset as the reference dataset and comparing multiple models on exactly the same data.
 
+## Quick start: predict CL/CD/CM for an aerofoil
+
+The repository ships its most accurate trained model — a per-target learned stacking ensemble,
+`models_dedicated/`, stored via [Git LFS](https://git-lfs.com) — so you can get a prediction without
+generating any data or training anything yourself:
+
+```bash
+git lfs pull                              # fetch the actual model weights (models_dedicated/*.joblib)
+uv sync --extra dev --extra torch         # --extra torch: one of the three ensemble members is a PyTorch MLP
+uv run python scripts/predict.py --model-dir models_dedicated --airfoil naca2412 --alpha-range -5 15 5 --re 5e5
+```
+
+```text
+aerofoil: naca2412
+geometry: max_thickness=0.1201  max_camber=0.0192  LE_radius=0.0144  TE_angle_deg=15.9514  area=0.0823
+ensemble: mlp + mlp_torch + hist_gb  (from models_dedicated)
+flow:     Re=5e+05  mach=0  n_crit=9  xtr_upper=1  xtr_lower=1
+
+    alpha        CL        CD        CM  L_over_D
+ -5.00000  -0.32969   0.01117  -0.05288 -29.52798
+  0.00000   0.23688   0.00720  -0.04999  32.88117
+  5.00000   0.82190   0.00932  -0.05508  88.18037
+ 10.00000   1.23026   0.01904  -0.03111  64.61273
+ 15.00000   1.38850   0.04813  -0.00435  28.84665
+```
+
+See [Using the trained ensemble](#using-the-trained-ensemble) below for the full set of options
+(other aerofoils, plotting, CSV export, `--random` sampled shapes, etc.).
+
 ## Research pipeline
 
 ```text
@@ -315,9 +344,17 @@ The learned weights are saved to `<model-dir>/stacking_weights.json`, so the ens
 
 ## Using the trained ensemble
 
-Once `<model-dir>/stacking_weights.json` exists, `airfoil-ml predict` is the inference
-interface: give it an aerofoil and a flow condition, get CL/CD/CM back. It never touches
-the training CSV, so it is the only step that works from the model artifacts alone.
+`models_dedicated/` in this repository *is* a trained stacking ensemble — `mlp` + `mlp_torch` +
+`hist_gb` combined via `stacking_weights.json` (see [Best result](#best-result-clcdcm-dedicated-stacking-ensemble)
+above) — checked in via [Git LFS](https://git-lfs.com) rather than trained by you. If `git lfs` isn't
+installed, get it from [git-lfs.com](https://git-lfs.com) (or your OS package manager) before cloning,
+or run `git lfs pull` after the fact to fetch the real `*.joblib` weights (a plain `git clone` without
+LFS leaves those files as small pointer stubs, not usable model weights). One of the three component
+models is a PyTorch MLP, so install with `uv sync --extra dev --extra torch`, not just `--extra dev`.
+
+`airfoil-ml predict` (or the equivalent `scripts/predict.py`) is the inference interface: give it an
+aerofoil and a flow condition, get CL/CD/CM back. It never touches the training CSV, so it works from
+`models_dedicated/` alone — no dataset generation or training required.
 
 ```bash
 # One aerofoil, one alpha
@@ -331,7 +368,7 @@ uv run python scripts/predict.py --model-dir models_dedicated \
 # or: airfoil-ml predict --model-dir models_dedicated --airfoil naca2412 --alpha 0 5 10
 ```
 
-Output format (coefficient values below are illustrative, not a published result):
+Real output from `models_dedicated/`, run at a coarser 5-degree step for brevity:
 
 ```text
 aerofoil: naca2412
@@ -340,9 +377,11 @@ ensemble: mlp + mlp_torch + hist_gb  (from models_dedicated)
 flow:     Re=5e+05  mach=0  n_crit=9  xtr_upper=1  xtr_lower=1
 
     alpha        CL        CD        CM  L_over_D
- -5.00000  -0.38237   0.01637  -0.03819 -23.35543
-  0.00000   0.13585   0.01634  -0.03883   8.31443
-  5.00000   0.68945   0.01639  -0.03942  42.07540
+ -5.00000  -0.32969   0.01117  -0.05288 -29.52798
+  0.00000   0.23688   0.00720  -0.04999  32.88117
+  5.00000   0.82190   0.00932  -0.05508  88.18037
+ 10.00000   1.23026   0.01904  -0.03111  64.61273
+ 15.00000   1.38850   0.04813  -0.00435  28.84665
 ```
 
 The `--airfoil` argument accepts any of:
