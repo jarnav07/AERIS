@@ -42,6 +42,17 @@ Evaluation always scores the model against the exact test-airfoil identities rec
 `log_cd` from `model_dir/training_config.json` unless explicitly overridden — see
 `training.py::evaluate_kulfan_model`.
 
+Predict with the project's most accurate model (the per-target learned stacking ensemble):
+```bash
+uv run python scripts/predict.py --model-dir models_dedicated --airfoil naca2412 --alpha-range -5 15 1 --re 5e5
+# or: airfoil-ml predict --model-dir ... --random --seed 7 --alpha 0 5 10 --show
+```
+
+Sample and view custom aerofoils without XFOIL (shapes only, no aerodynamics):
+```bash
+uv run python scripts/generate_airfoils.py --count 6 --seed 7 --output-dir data/generated/custom_airfoils --show
+```
+
 ## Remote data generation (GCP VM)
 
 Large-scale dataset generation runs on the `ml-aerofoil-data-generation` GCP VM (project
@@ -111,6 +122,29 @@ scikit-learn-compatible `fit`/`predict` interface so it drops into the same trai
 models. `training.py` optionally log-transforms `CD` (`--log-cd`) so the model minimizes relative rather
 than absolute drag error, then inverse-transforms predictions before computing metrics — always keep
 `_transform_labels`/`_inverse_labels` symmetric when touching this.
+
+### Inference layer
+
+`predict.py::StackingEnsemblePredictor` is the read side of the stacking-ensemble artifact and the
+only path that produces a prediction from the model directory alone (no training CSV). It loads
+`stacking_weights.json`, the component `<name>.joblib` models and their shared `preprocessor.joblib`,
+inverse-transforms each component to physical units, then combines them via
+`training.py::apply_stacking_weights` — the *same* helper `fit_stacking_ensemble` scores with, so a
+saved weights file always reproduces the metrics the fit reported. Query features are built by
+`predict.py::kulfan_feature_frame`, which routes through `training.py::add_geometry_features` rather
+than recomputing the derived geometry columns, so inference and training can't drift apart.
+
+`airfoil_sources.py` resolves whatever the user supplies (AeroSandbox database name, NACA
+designation, coordinate `.dat`/`.txt`, Kulfan `.json`, or a fresh draw from
+`training_data_generation.sample_airfoil`) down to one `asb.KulfanAirfoil`, and holds the section /
+sampling plotting helpers. Note that `evaluation.py` pins matplotlib to the headless `Agg` backend at
+import time, so `plt.show()` cannot work anywhere in this package — "viewing" always means writing a
+PNG and handing it to the OS via `airfoil_sources.open_in_viewer`.
+
+The `predict` and `generate-airfoils` argparse setups live in `cli.py`
+(`add_predict_arguments`/`run_predict`, `add_generate_airfoils_arguments`/`run_generate_airfoils`) and
+are imported by `scripts/predict.py` and `scripts/generate_airfoils.py`, so unlike the older
+`scripts/train.py` those wrappers cannot drift from the CLI subcommand.
 
 ### Evaluation layer
 

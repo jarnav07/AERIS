@@ -34,7 +34,7 @@ KULFAN_FEATURE_COLUMNS = [
     *GEOMETRY_FEATURE_COLUMNS,
 ]
 RE_COLUMN_INDEX = KULFAN_FEATURE_COLUMNS.index("Re")
-_KULFAN_VECTOR_COLUMNS = [
+KULFAN_VECTOR_COLUMNS = [
     *[f"kulfan_upper_{i}" for i in range(8)],
     *[f"kulfan_lower_{i}" for i in range(8)],
     "kulfan_LE_weight", "kulfan_TE_thickness",
@@ -91,8 +91,8 @@ def add_geometry_features(frame: pd.DataFrame) -> pd.DataFrame:
     # produce pandas' _x/_y suffixed duplicate columns.
     frame = frame.drop(columns=[c for c in GEOMETRY_FEATURE_COLUMNS if c in frame.columns])
 
-    unique = frame.drop_duplicates(subset="airfoil_id")[["airfoil_id", *_KULFAN_VECTOR_COLUMNS]]
-    kulfan_matrix = unique[_KULFAN_VECTOR_COLUMNS].to_numpy(float)
+    unique = frame.drop_duplicates(subset="airfoil_id")[["airfoil_id", *KULFAN_VECTOR_COLUMNS]]
+    kulfan_matrix = unique[KULFAN_VECTOR_COLUMNS].to_numpy(float)
     geometry = np.stack([_geometry_features_for_airfoil(row) for row in kulfan_matrix])
     geometry_by_airfoil = pd.DataFrame(geometry, columns=GEOMETRY_FEATURE_COLUMNS)
     geometry_by_airfoil.insert(0, "airfoil_id", unique["airfoil_id"].to_numpy())
@@ -281,6 +281,31 @@ def load_model_bundle(model_dir: str | Path, model_name: str = "mlp") -> tuple[o
     return joblib.load(model_dir / f"{model_name}.joblib"), FeaturePreprocessor.load(model_dir / "preprocessor.joblib")
 
 
+def apply_stacking_weights(
+    predictions: dict[str, np.ndarray],
+    model_names: list[str],
+    weights: dict[str, dict[str, float]],
+) -> np.ndarray:
+    """Combine per-model physical-unit predictions using saved stacking weights.
+
+    ``predictions`` maps model name to that model's ``(n_rows, >=3)`` prediction in
+    physical units; ``weights`` is the ``"weights"`` block of
+    ``stacking_weights.json`` (target -> {model name: weight, "intercept": value}).
+    Both ``fit_stacking_ensemble`` and the inference-time predictor in
+    ``predict.py`` go through this, so a saved weights file always reproduces the
+    numbers the fit reported rather than relying on two parallel implementations.
+    """
+    targets = list(weights)
+    n_rows = len(next(iter(predictions.values())))
+    combined = np.zeros((n_rows, len(targets)))
+    for i, target in enumerate(targets):
+        target_weights = weights[target]
+        combined[:, i] = target_weights.get("intercept", 0.0)
+        for name in model_names:
+            combined[:, i] += target_weights[name] * predictions[name][:, i]
+    return combined
+
+
 def evaluate_ensemble(
     csv_path: str | Path,
     model_dir: str | Path,
@@ -397,15 +422,16 @@ def fit_stacking_ensemble(
     test_preds = _predict_all(test_frame)
 
     stacking_weights: dict[str, dict[str, float]] = {}
-    test_pred = np.zeros_like(test_y)
     for i, target in enumerate(("cl", "cd", "cm")):
         x_val = np.column_stack([val_preds[name][:, i] for name in model_names])
         reg = Ridge(alpha=alpha, positive=True)
         reg.fit(x_val, val_y[:, i])
         stacking_weights[target] = {name: float(w) for name, w in zip(model_names, reg.coef_)}
         stacking_weights[target]["intercept"] = float(reg.intercept_)
-        x_test = np.column_stack([test_preds[name][:, i] for name in model_names])
-        test_pred[:, i] = reg.predict(x_test)
+
+    # Score through the serialised weights rather than the fitted Ridge objects, so
+    # the reported metrics are the ones stacking_weights.json actually reproduces.
+    test_pred = apply_stacking_weights(test_preds, model_names, stacking_weights)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -67,6 +67,8 @@ aeris/
 │   ├── geometry.py                  # geometry processing
 │   ├── features.py                  # feature construction/scaling
 │   ├── data.py                      # validation and grouped splitting
+│   ├── predict.py                   # stacking-ensemble inference interface
+│   ├── airfoil_sources.py           # resolve/sample/save/plot aerofoils
 │   ├── evaluation.py                # metrics and evaluation utilities
 │   ├── error_analysis.py             # error/regime analysis
 │   ├── drag_analysis.py              # drag-focused analysis
@@ -74,7 +76,10 @@ aeris/
 ├── scripts/
 │   ├── generate_dataset.py           # dataset-generation entry point
 │   ├── train.py                     # training entry point
-│   └── evaluate_models.py            # evaluation entry point
+│   ├── evaluate_models.py            # evaluation entry point
+│   ├── fit_stacking_ensemble.py      # fits the stacking ensemble artifact
+│   ├── predict.py                    # predict CL/CD/CM for one aerofoil
+│   └── generate_airfoils.py          # sample and view custom aerofoils
 ├── data/
 │   ├── raw/                          # optional historical/source data
 │   ├── generated/                    # canonical generated dataset
@@ -307,6 +312,83 @@ uv run python scripts/fit_stacking_ensemble.py --model-dir models_dedicated \
 ```
 
 The learned weights are saved to `<model-dir>/stacking_weights.json`, so the ensemble is a reproducible artifact rather than a one-off result. This model only predicts CL/CD/CM — use the default full-target training (no `--target-cols`) if boundary-layer predictions are also needed.
+
+## Using the trained ensemble
+
+Once `<model-dir>/stacking_weights.json` exists, `airfoil-ml predict` is the inference
+interface: give it an aerofoil and a flow condition, get CL/CD/CM back. It never touches
+the training CSV, so it is the only step that works from the model artifacts alone.
+
+```bash
+# One aerofoil, one alpha
+uv run python scripts/predict.py --model-dir models_dedicated --airfoil naca2412 --re 5e5
+
+# A full predicted polar, written to CSV and plotted
+uv run python scripts/predict.py --model-dir models_dedicated \
+  --airfoil naca2412 --alpha-range -5 15 1 --re 5e5 \
+  --csv-out results/predictions/naca2412.csv --plot results/predictions/naca2412.png
+
+# or: airfoil-ml predict --model-dir models_dedicated --airfoil naca2412 --alpha 0 5 10
+```
+
+Output format (coefficient values below are illustrative, not a published result):
+
+```text
+aerofoil: naca2412
+geometry: max_thickness=0.1201  max_camber=0.0192  LE_radius=0.0144  TE_angle_deg=15.9514  area=0.0823
+ensemble: mlp + mlp_torch + hist_gb  (from models_dedicated)
+flow:     Re=5e+05  mach=0  n_crit=9  xtr_upper=1  xtr_lower=1
+
+    alpha        CL        CD        CM  L_over_D
+ -5.00000  -0.38237   0.01637  -0.03819 -23.35543
+  0.00000   0.13585   0.01634  -0.03883   8.31443
+  5.00000   0.68945   0.01639  -0.03942  42.07540
+```
+
+The `--airfoil` argument accepts any of:
+
+| Form | Example |
+|---|---|
+| AeroSandbox database name | `--airfoil e63` |
+| NACA designation | `--airfoil naca2412` |
+| Coordinate file (`.dat`/`.txt`) | `--airfoil data/raw/coords/ah79k135.dat` |
+| Kulfan `.json` from `generate-airfoils` | `--airfoil data/generated/custom_airfoils/sampled_0000.json` |
+| A fresh sample from the dataset generator | `--random --seed 7` |
+
+Other useful flags: `--n-crit`/`--xtr-upper`/`--xtr-lower` to set the transition model
+(defaults: `9`, free, free — matching XFOIL's standard criterion and the 80% of generated
+cases that used free transition), `--per-model` to see each component model's own
+prediction alongside the ensemble, `--json` for machine-readable output on stdout, and
+`--show` to open the predicted polar and the aerofoil section in the platform viewer.
+
+Predictions outside the sampled operating envelope (Re outside ~1.8e3–5.6e7, |alpha| > 25
+degrees, or mach > 0) are extrapolation and are reported as `warning:` lines.
+
+From Python:
+
+```python
+from airfoil_ml.predict import StackingEnsemblePredictor
+
+predictor = StackingEnsemblePredictor.load("models_dedicated")
+table = predictor.predict("naca2412", alpha=[0, 5, 10], Re=5e5)   # DataFrame: CL, CD, CM, L_over_D
+```
+
+## Generating and viewing custom aerofoils
+
+`airfoil-ml generate-airfoils` draws aerofoils from the same sampler
+`training_data_generation.py` uses to build the dataset (convex combination of three
+database parents plus a covariance-based perturbation), so generated shapes are
+in-distribution for the surrogate. Unlike `scripts/generate_dataset.py` it only draws
+*shapes* and never calls XFOIL, so it runs anywhere:
+
+```bash
+uv run python scripts/generate_airfoils.py --count 6 --seed 7 \
+  --output-dir data/generated/custom_airfoils --show
+```
+
+Each aerofoil is written as both a Kulfan `.json` (round-trips the 18 coefficients
+exactly — this is the form to feed back to `predict`) and a coordinate `.dat`, alongside a
+PNG grid of the sections. `--show` opens that PNG in the platform image viewer.
 
 ## Legacy and alternative datasets
 

@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.DS_Store
+.idea/
 
 # Downloaded/generated research artifacts
 data/raw/*
