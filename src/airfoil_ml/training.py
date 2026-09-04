@@ -17,8 +17,14 @@ from .evaluation import regression_metrics, save_evaluation_plots
 from .features import FeaturePreprocessor
 from .models import ModelConfig, make_models
 
+_CHORD_STATIONS = (0.15, 0.30, 0.45, 0.60, 0.75)
 GEOMETRY_FEATURE_COLUMNS = [
     "geom_max_thickness", "geom_max_camber", "geom_le_radius", "geom_te_angle", "geom_area", "geom_perimeter",
+    # Pitching moment depends on the pressure distribution over the whole chord, not
+    # just a single max-thickness/max-camber scalar, so sample the thickness and
+    # camber lines at a handful of chordwise stations too.
+    *[f"geom_thickness_{int(x * 100)}" for x in _CHORD_STATIONS],
+    *[f"geom_camber_{int(x * 100)}" for x in _CHORD_STATIONS],
 ]
 KULFAN_FEATURE_COLUMNS = [
     *[f"kulfan_upper_{i}" for i in range(8)],
@@ -52,13 +58,18 @@ def _geometry_features_for_airfoil(kulfan_row: np.ndarray) -> np.ndarray:
         TE_thickness=kulfan_row[17],
     )
     try:
-        return np.array([
-            float(airfoil.max_thickness()),
-            float(airfoil.max_camber()),
-            float(airfoil.LE_radius()),
-            float(airfoil.TE_angle()),
-            float(airfoil.area()),
-            float(airfoil.perimeter()),
+        stations = np.array(_CHORD_STATIONS)
+        return np.concatenate([
+            [
+                float(airfoil.max_thickness()),
+                float(airfoil.max_camber()),
+                float(airfoil.LE_radius()),
+                float(airfoil.TE_angle()),
+                float(airfoil.area()),
+                float(airfoil.perimeter()),
+            ],
+            np.asarray(airfoil.local_thickness(stations), dtype=float),
+            np.asarray(airfoil.local_camber(stations), dtype=float),
         ])
     except Exception:
         return np.zeros(len(GEOMETRY_FEATURE_COLUMNS))
@@ -74,6 +85,11 @@ def add_geometry_features(frame: pd.DataFrame) -> pd.DataFrame:
     """
     if all(col in frame.columns for col in GEOMETRY_FEATURE_COLUMNS):
         return frame
+
+    # Drop any partial overlap (e.g. a CSV saved by an older version of this function
+    # with a subset of today's GEOMETRY_FEATURE_COLUMNS) so the merge below can't
+    # produce pandas' _x/_y suffixed duplicate columns.
+    frame = frame.drop(columns=[c for c in GEOMETRY_FEATURE_COLUMNS if c in frame.columns])
 
     unique = frame.drop_duplicates(subset="airfoil_id")[["airfoil_id", *_KULFAN_VECTOR_COLUMNS]]
     kulfan_matrix = unique[_KULFAN_VECTOR_COLUMNS].to_numpy(float)
@@ -140,6 +156,7 @@ def train_from_kulfan_csv(
     model_config: ModelConfig | None = None,
     only: list[str] | None = None,
     log_cd: bool = False,
+    target_cols: list[str] | None = None,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Train on the generated canonical Kulfan/XFOIL dataset.
 
@@ -147,13 +164,18 @@ def train_from_kulfan_csv(
     CSV (see ``training_data_generation.py``); scaling is fit here rather than
     through ``features.fit_preprocessor``, which targets the separate
     coordinate-file-based pipeline in ``data.py``.
+
+    ``target_cols`` defaults to the full 197-column set (CL/CD/CM/Top_Xtr/Bot_Xtr
+    plus every boundary-layer column); pass e.g. ``["CL", "CD", "CM"]`` to train a
+    model dedicated to just the headline aero coefficients instead of splitting its
+    capacity/loss budget across the 194 auxiliary boundary-layer targets too.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     frame = pd.read_csv(csv_path)
     frame = add_geometry_features(frame)
-    target_cols = _target_columns(frame)
+    target_cols = target_cols if target_cols is not None else _target_columns(frame)
 
     split = grouped_split_by_id(
         frame,
@@ -232,9 +254,26 @@ def train_from_kulfan_csv(
         np.savez_compressed(output_dir / f"test_predictions_{name}.npz", actual=test_y, predicted=test_pred, indices=split["test"])
 
     (output_dir / "metrics.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-    (output_dir / "training_config.json").write_text(json.dumps({"seed": seed, "log_cd": log_cd, "model_config": asdict(config)}, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "training_config.json").write_text(
+        json.dumps({"seed": seed, "log_cd": log_cd, "target_cols": target_cols, "model_config": asdict(config)}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     return results
+
+
+def _read_target_cols(model_dir: Path, frame: pd.DataFrame) -> list[str]:
+    """The target columns a model was trained on, from training_config.json if recorded.
+
+    Falls back to the full 197-column set for model directories saved before
+    ``target_cols`` was recorded (train_from_kulfan_csv always used the full set then).
+    """
+    config_path = model_dir / "training_config.json"
+    if config_path.exists():
+        recorded = json.loads(config_path.read_text(encoding="utf-8")).get("target_cols")
+        if recorded is not None:
+            return recorded
+    return _target_columns(frame)
 
 
 def load_model_bundle(model_dir: str | Path, model_name: str = "mlp") -> tuple[object, FeaturePreprocessor]:
@@ -276,7 +315,7 @@ def evaluate_ensemble(
     if test_frame.empty:
         raise ValueError(f"none of the test airfoils recorded in {manifest_path} are present in {csv_path}")
 
-    test_y = _select_columns(test_frame, _target_columns(frame), "target")
+    test_y = _select_columns(test_frame, _read_target_cols(model_dir, frame), "target")
     weights = weights or [1.0] * len(model_names)
     if len(weights) != len(model_names):
         raise ValueError("weights must have the same length as model_names")
@@ -336,7 +375,7 @@ def evaluate_kulfan_model(
 
     model, processor = load_model_bundle(model_dir, model_name)
     test_x = _select_columns(test_frame, KULFAN_FEATURE_COLUMNS, "feature")
-    test_y = _select_columns(test_frame, _target_columns(frame), "target")
+    test_y = _select_columns(test_frame, _read_target_cols(model_dir, frame), "target")
     test_pred = _inverse_labels(processor, model.predict(transform_kulfan_inputs(processor, test_x)), log_cd)
 
     metrics = regression_metrics(test_y, test_pred)
