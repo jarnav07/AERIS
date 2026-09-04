@@ -242,6 +242,66 @@ def load_model_bundle(model_dir: str | Path, model_name: str = "mlp") -> tuple[o
     return joblib.load(model_dir / f"{model_name}.joblib"), FeaturePreprocessor.load(model_dir / "preprocessor.joblib")
 
 
+def evaluate_ensemble(
+    csv_path: str | Path,
+    model_dir: str | Path,
+    model_names: list[str],
+    output_dir: str | Path = "results/evaluation",
+    log_cd: bool | None = None,
+    max_polar_plots: int | None = None,
+    weights: list[float] | None = None,
+) -> dict[str, float]:
+    """Evaluate an unweighted (or explicitly weighted) average ensemble of already-trained models.
+
+    All ``model_names`` must live in the same ``model_dir`` (so they share one
+    ``split_manifest.json`` test partition and ``training_config.json`` log_cd
+    setting) but each keeps its own fitted preprocessor: predictions are
+    inverse-transformed to physical units per model before averaging, since
+    averaging in each model's own scaled space would not be meaningful across
+    independently-fit scalers.
+    """
+    model_dir = Path(model_dir)
+    manifest_path = model_dir / "split_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"no split manifest found at {manifest_path}; train a model first")
+    test_airfoils = set(json.loads(manifest_path.read_text(encoding="utf-8"))["test_airfoils"])
+
+    if log_cd is None:
+        config_path = model_dir / "training_config.json"
+        log_cd = bool(json.loads(config_path.read_text(encoding="utf-8"))["log_cd"]) if config_path.exists() else False
+
+    frame = pd.read_csv(csv_path)
+    frame = add_geometry_features(frame)
+    test_frame = frame[frame["airfoil_id"].astype(str).isin(test_airfoils)].reset_index(drop=True)
+    if test_frame.empty:
+        raise ValueError(f"none of the test airfoils recorded in {manifest_path} are present in {csv_path}")
+
+    test_y = _select_columns(test_frame, _target_columns(frame), "target")
+    weights = weights or [1.0] * len(model_names)
+    if len(weights) != len(model_names):
+        raise ValueError("weights must have the same length as model_names")
+
+    weighted_sum = None
+    for name, weight in zip(model_names, weights):
+        model, processor = load_model_bundle(model_dir, name)
+        test_x = _select_columns(test_frame, KULFAN_FEATURE_COLUMNS, "feature")
+        pred = _inverse_labels(processor, model.predict(transform_kulfan_inputs(processor, test_x)), log_cd)
+        weighted_sum = weight * pred if weighted_sum is None else weighted_sum + weight * pred
+    test_pred = weighted_sum / sum(weights)
+
+    metrics = regression_metrics(test_y, test_pred)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+
+    plot_frame = test_frame[["airfoil_id", "alpha", "Re"]].rename(columns={"alpha": "alpha_deg", "Re": "reynolds"})
+    plot_frame["cl"], plot_frame["cd"], plot_frame["cm"] = test_y[:, 0], test_y[:, 1], test_y[:, 2]
+    save_evaluation_plots(plot_frame, test_y[:, :3], test_pred[:, :3], output_dir, title_prefix="ensemble", max_polar_plots=max_polar_plots)
+
+    return metrics
+
+
 def evaluate_kulfan_model(
     csv_path: str | Path,
     model_dir: str | Path,
