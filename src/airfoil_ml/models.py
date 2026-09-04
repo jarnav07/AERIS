@@ -14,7 +14,12 @@ from sklearn.neural_network import MLPRegressor
 @dataclass(frozen=True)
 class ModelConfig:
     seed: int = 42
-    hidden_layers: tuple[int, ...] = (128, 64, 32)
+    # (256, 128, 64, 32) beat (128, 64, 32) and every other depth/width tried in
+    # scripts/tune_models.py's search on a 12k-airfoil subsample of the full
+    # generated dataset (score 0.1158 vs the next-best 0.1184); batch_size=64
+    # (models.py's mlp below) also won that search outright, contrary to the
+    # assumption that it was too small for a 600k+-row dataset.
+    hidden_layers: tuple[int, ...] = (256, 128, 64, 32)
     max_iter: int = 600
     early_stopping: bool = True
 
@@ -31,12 +36,15 @@ def make_models(config: ModelConfig | None = None) -> dict[str, Any]:
             # a per-target mean, so a near-unbounded leaf count at
             # dataset-generation scale (hundreds of thousands of training
             # rows) multiplies out to tens of GB across 250 trees and can
-            # exhaust host memory. min_samples_leaf=25 plus an explicit
-            # max_leaf_nodes cap bounds per-tree memory regardless of how
-            # large the training set grows.
-            min_samples_leaf=25,
-            max_leaf_nodes=5000,
-            max_features=0.7,
+            # exhaust host memory. max_leaf_nodes is an explicit hard cap on
+            # per-tree memory regardless of how large the training set grows
+            # (12000 leaves x 197 targets x 8 bytes x 250 trees ~= 4.7GB,
+            # still well within budget); min_samples_leaf=5/max_leaf_nodes=
+            # 12000 won scripts/tune_models.py's search over the previous
+            # min_samples_leaf=25/max_leaf_nodes=5000 (score 0.2286 vs 0.2613).
+            min_samples_leaf=5,
+            max_leaf_nodes=12000,
+            max_features=0.8,
             random_state=config.seed,
             n_jobs=-1,
         ),
@@ -55,9 +63,12 @@ def make_models(config: ModelConfig | None = None) -> dict[str, Any]:
         ),
         "hist_gb": MultiOutputRegressor(
             HistGradientBoostingRegressor(
-                max_iter=200,
-                learning_rate=0.08,
-                max_leaf_nodes=31,
+                # learning_rate=0.1/max_leaf_nodes=127/max_iter=250 won
+                # scripts/tune_models.py's search over the previous
+                # 0.08/31/200 (score 0.1868 vs 0.2105).
+                max_iter=250,
+                learning_rate=0.1,
+                max_leaf_nodes=127,
                 early_stopping=True,
                 n_iter_no_change=25,
                 validation_fraction=0.1,
