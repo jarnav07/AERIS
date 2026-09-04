@@ -1,0 +1,20 @@
+{
+  "seed": 42,
+  "log_cd": true,
+  "target_cols": [
+    "CL",
+    "CD",
+    "CM"
+  ],
+  "model_config": {
+    "seed": 42,
+    "hidden_layers": [
+      256,
+      128,
+      64,
+      32
+    ],
+    "max_iter": 600,
+    "early_stopping": true
+  }
+}
