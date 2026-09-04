@@ -164,17 +164,19 @@ The current configuration uses 250 trees. It is a classical non-linear benchmark
 
 ### 3. Scikit-learn MLP
 
-The MLP is a fully connected feed-forward neural network with the current hidden architecture:
+The MLP is a fully connected feed-forward neural network. The hidden architecture (`ModelConfig.hidden_layers` in `models.py`) defaults to:
 
 ```text
-Input → 128 → 64 → 32 → Output
+Input → 256 → 128 → 64 → 32 → Output
 ```
 
-ReLU activations introduce non-linearity. Backpropagation and the Adam optimiser adjust the network weights to minimise prediction error.
+ReLU activations introduce non-linearity. Backpropagation and the Adam optimiser adjust the network weights to minimise prediction error. This architecture — along with Random Forest's and HistGB's hyperparameters below — was chosen by a search (`scripts/tune_models.py`) rather than by hand; see [Results](#results).
 
 ```text
 geometry + flow conditions
             ↓
+         Dense 256
+            ↓ ReLU
          Dense 128
             ↓ ReLU
           Dense 64
@@ -202,11 +204,11 @@ Tree 2 → correction
 Final prediction
 ```
 
-The current configuration uses 200 boosting iterations and wraps separate regressors for the multiple targets. It provides a different tree-based learning mechanism from Random Forest.
+The current configuration uses 250 boosting iterations and wraps separate regressors for the multiple targets. It provides a different tree-based learning mechanism from Random Forest.
 
 ### 5. PyTorch MLP
 
-The PyTorch MLP is a second fully connected neural network using the core `(128, 64, 32)` architecture, implemented directly in PyTorch. It uses tensor operations, Adam optimisation and mean-squared-error loss, with training controls such as early stopping/checkpointing available through the training pipeline.
+The PyTorch MLP is a second fully connected neural network sharing `ModelConfig.hidden_layers` with the scikit-learn MLP above, implemented directly in PyTorch. It uses tensor operations, Adam optimisation and mean-squared-error loss, with training controls such as early stopping/checkpointing available through the training pipeline.
 
 It is included separately from the scikit-learn MLP because PyTorch provides greater control over the neural-network architecture and training process and can be extended more readily for larger datasets or custom architectures.
 
@@ -258,6 +260,53 @@ uv run python scripts/evaluate_models.py
 ```
 
 The scientific reference for the generated training labels is XFOIL. CFD results can be used as an independent higher-fidelity comparison and should not be mixed into the ML training labels when the objective is to measure how accurately the models reproduce XFOIL.
+
+## Results
+
+Metrics below are computed on the held-out test partition (grouped by aerofoil identity, never seen during training) of the canonical dataset's full production run: 610,652 rows across 100,279 aerofoils (`training_data_generation.py`, 106,000 requested cases, ~94.6% XFOIL success rate). "Relative error" is MAE divided by the dataset-wide mean `|actual value|` for that target (CL≈0.68, CD≈0.064, CM≈0.060). Percentage-based metrics (MAPE-style, computed per row) are noted separately where used — they are distorted for CL/CM by rows where the true value is near zero, since a small absolute error becomes a huge percentage there; CD does not have this problem, since drag is always positive.
+
+### Baseline: all five models, full 197-target training
+
+Each model trained multi-output against all 197 targets (CL, CD, CM, `Top_Xtr`, `Bot_Xtr`, plus 192 boundary-layer columns), default hyperparameters, no log-CD transform, no engineered geometry features:
+
+| Model | CL rel. error | CD rel. error | CM rel. error |
+|---|---|---|---|
+| mlp | 10.2% | 17.6% | 18.9% |
+| mlp_torch | 11.2% | 19.6% | 22.4% |
+| hist_gb | 16.6% | 19.2% | 27.0% |
+| random_forest | 21.2% | 21.4% | 40.7% |
+| ridge | 39.0% | 66.3% | 48.9% |
+
+### Improving accuracy
+
+Starting from that baseline, the following were investigated in turn:
+
+- **Log-CD transform** (`--log-cd`): trains on `log(CD)` instead of raw `CD`, so the model minimises relative rather than absolute drag error. CD's true per-row percentage error dropped from 37.0% (mean) / 20.8% (median) to 16.1% / 11.2%. (A naive MAE-based comparison initially made this look like it *hurt* CD — MAE trades off some absolute accuracy on the high-CD tail for better relative accuracy on the many low-CD rows, so it has to be judged on a relative metric to see the improvement.)
+- **Derived geometry features** (`training.py::add_geometry_features`): max thickness/camber, leading-edge radius, trailing-edge angle, area, perimeter, plus thickness and camber sampled at 5 chordwise stations — computed once per aerofoil from its Kulfan coefficients (~0.5 ms/aerofoil). CM in particular depends on the whole chordwise pressure distribution, not a single max-camber scalar, so the per-station samples matter more for CM than for CL/CD.
+- **Hyperparameter search** (`scripts/tune_models.py`, searched on a 12k-aerofoil subsample so each candidate fit stays fast): grew the MLP architecture to `(256, 128, 64, 32)`, Random Forest's leaf cap to `max_leaf_nodes=12000` (still memory-bounded — see the comment in `models.py`), and increased HistGB's learning rate, leaf count and iteration count.
+- **Training a model dedicated to just CL/CD/CM** (`--target-cols CL CD CM`) instead of splitting capacity/loss budget across all 197 targets including the 194 boundary-layer columns — this was the single largest improvement, roughly halving CM's error.
+- **Ensembling**: an equal-weight average of the best individual models (`scripts/evaluate_ensemble.py`) beat every one of them individually; a *learned* per-target stacking weight (`scripts/fit_stacking_ensemble.py`, `Ridge(positive=True)` fit on the validation split) beat the equal-weight average further, since a model that's strong on CL but weak on CM can be weighted accordingly per target instead of with one compromise weight for both.
+
+### Best result: CL/CD/CM-dedicated stacking ensemble
+
+`mlp` + `mlp_torch` + `hist_gb`, each retrained with `--log-cd --target-cols CL CD CM` on the tuned hyperparameters above, combined with per-target learned stacking weights:
+
+| Target | MAE ÷ mean\|actual\| | Median per-row % error |
+|---|---|---|
+| CL | 6.5% | 4.4% |
+| CD | 6.9% | 4.5% |
+| CM | 9.9% | 8.1% |
+
+Reproduce with:
+
+```bash
+uv run python scripts/train.py --output-dir models_dedicated \
+  --only mlp mlp_torch hist_gb --log-cd --target-cols CL CD CM
+uv run python scripts/fit_stacking_ensemble.py --model-dir models_dedicated \
+  --models mlp mlp_torch hist_gb
+```
+
+The learned weights are saved to `<model-dir>/stacking_weights.json`, so the ensemble is a reproducible artifact rather than a one-off result. This model only predicts CL/CD/CM — use the default full-target training (no `--target-cols`) if boundary-layer predictions are also needed.
 
 ## Legacy and alternative datasets
 
