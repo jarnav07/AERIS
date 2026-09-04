@@ -341,6 +341,88 @@ def evaluate_ensemble(
     return metrics
 
 
+def fit_stacking_ensemble(
+    csv_path: str | Path,
+    model_dir: str | Path,
+    model_names: list[str],
+    output_dir: str | Path = "results/evaluation",
+    log_cd: bool | None = None,
+    max_polar_plots: int | None = None,
+    alpha: float = 1.0,
+) -> dict[str, float]:
+    """Fit and evaluate a per-target learned-weight stacking ensemble over CL/CD/CM.
+
+    Unlike ``evaluate_ensemble``'s single scalar weight per model (applied
+    identically to every target), this fits one non-negative-weighted linear
+    combination *per target* (via ``Ridge(positive=True)``) on the validation
+    split, then scores it on the held-out test split. A model that is strong on
+    CL but weak on CM, say, can end up with a high CL weight and a low CM weight
+    instead of one compromise weight for both. Weights are saved to
+    ``model_dir/stacking_weights.json`` (keyed by target, model name, and
+    "intercept") so the ensemble is a reproducible artifact, not just a script run.
+    """
+    from sklearn.linear_model import Ridge
+
+    model_dir = Path(model_dir)
+    manifest_path = model_dir / "split_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"no split manifest found at {manifest_path}; train a model first")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    test_airfoils = manifest["test_airfoils"]
+
+    if log_cd is None:
+        config_path = model_dir / "training_config.json"
+        log_cd = bool(json.loads(config_path.read_text(encoding="utf-8"))["log_cd"]) if config_path.exists() else False
+
+    frame = pd.read_csv(csv_path)
+    frame = add_geometry_features(frame)
+    # Reproduce the exact train/validation/test split used at training time (same
+    # seed default and fixed test_airfoils) so validation rows used to fit the
+    # stacking weights never overlap the held-out test partition.
+    split = grouped_split_by_id(frame, seed=manifest.get("seed", 42), test_airfoils=test_airfoils)
+    val_frame, test_frame = frame.iloc[split["validation"]], frame.iloc[split["test"]]
+    target_cols = _read_target_cols(model_dir, frame)[:3]
+
+    def _predict_all(sub_frame: pd.DataFrame) -> dict[str, np.ndarray]:
+        x = _select_columns(sub_frame, KULFAN_FEATURE_COLUMNS, "feature")
+        preds = {}
+        for name in model_names:
+            model, processor = load_model_bundle(model_dir, name)
+            preds[name] = _inverse_labels(processor, model.predict(transform_kulfan_inputs(processor, x)), log_cd)
+        return preds
+
+    val_y = _select_columns(val_frame, target_cols, "target")
+    test_y = _select_columns(test_frame, target_cols, "target")
+    val_preds = _predict_all(val_frame)
+    test_preds = _predict_all(test_frame)
+
+    stacking_weights: dict[str, dict[str, float]] = {}
+    test_pred = np.zeros_like(test_y)
+    for i, target in enumerate(("cl", "cd", "cm")):
+        x_val = np.column_stack([val_preds[name][:, i] for name in model_names])
+        reg = Ridge(alpha=alpha, positive=True)
+        reg.fit(x_val, val_y[:, i])
+        stacking_weights[target] = {name: float(w) for name, w in zip(model_names, reg.coef_)}
+        stacking_weights[target]["intercept"] = float(reg.intercept_)
+        x_test = np.column_stack([test_preds[name][:, i] for name in model_names])
+        test_pred[:, i] = reg.predict(x_test)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "stacking_weights.json").write_text(
+        json.dumps({"model_names": model_names, "weights": stacking_weights}, indent=2) + "\n", encoding="utf-8"
+    )
+
+    metrics = regression_metrics(test_y, test_pred)
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+
+    plot_frame = test_frame[["airfoil_id", "alpha", "Re"]].rename(columns={"alpha": "alpha_deg", "Re": "reynolds"})
+    plot_frame["cl"], plot_frame["cd"], plot_frame["cm"] = test_y[:, 0], test_y[:, 1], test_y[:, 2]
+    save_evaluation_plots(plot_frame, test_y, test_pred, output_dir, title_prefix="stacking_ensemble", max_polar_plots=max_polar_plots)
+
+    return metrics
+
+
 def evaluate_kulfan_model(
     csv_path: str | Path,
     model_dir: str | Path,
